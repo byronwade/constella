@@ -1,0 +1,142 @@
+{
+  "system": {
+    "description": "Rules for developing a cross-platform file system indexing and search tool inspired by modern concepts like https://grep.app/. The system leverages Rust for backend performance and efficiency, with a React-based UI using Tauri as the framework for bundling. All components must adhere to strict organizational and security guidelines, and the system must remain clean, fast, and feature-rich.",
+    "core_languages": ["Rust", "JavaScript", "TypeScript"],
+    "frameworks_and_tools": ["Tantivy", "Tauri", "React"],
+    "objectives": {
+      "primary_goal": "Provide a native file system for all computers with instant, full-featured search and indexing capabilities, leveraging modern concepts from grep.app for advanced search functionality.",
+      "design_principles": [
+        "Strict adherence to project folder structure.",
+        "Security-first approach to all file system operations.",
+        "Optimization for performance, with speed as the highest priority.",
+        "A clean, clutter-free codebase that is regularly reviewed for unused files."
+      ]
+    },
+    "folder_structure": {
+      "overview": "Define a strict, non-negotiable folder structure to organize files for Tauri, frontend, backend, and shared assets.",
+      "folders": {
+        "src": {
+          "description": "Main directory for Tauri and frontend (React) code.",
+          "structure": {
+            "components": "Reusable React UI components. Do not create component folders outside this directory.",
+            "actions": "Logic for interacting with the Rust backend API. API calls must only be made through actions in this folder.",
+            "pages": "Route-based React pages for the UI. No stray page files or folders allowed.",
+            "styles": "Global and scoped CSS files, adhering to a consistent styling strategy.",
+            "utils": "Frontend utility functions. These must not include backend-specific logic.",
+            "assets": "Shared static assets like icons, images, and fonts.",
+            "index.html": "HTML template for the Tauri application.",
+            "main.tsx": "Main entry point for the React application.",
+            "App.tsx": "Root React component."
+          }
+        },
+        "src-tauri": {
+          "description": "Holds all Tauri-specific configuration and Rust backend code.",
+          "structure": {
+            "commands": "Holds Tauri command handlers for backend/frontend communication.",
+            "indexing": "Handles Tantivy indexing logic and schema definition.",
+            "file_system": "Handles file system traversal, metadata extraction, and content parsing.",
+            "api": "API endpoints exposed to the frontend.",
+            "utils": "Utility functions for backend logic.",
+            "main.rs": "Entry point for the Rust backend.",
+            "tauri.conf.json": "Tauri configuration file.",
+            "build.rs": "Optional build script for custom compilation steps."
+          }
+        },
+        "public": {
+          "description": "Public directory for static assets served without processing.",
+          "structure": {
+            "favicon.ico": "Application favicon.",
+            "manifest.json": "Web manifest for the Tauri application."
+          }
+        }
+      },
+      "enforcement": "Cursor must check the existing directory structure and edit files within their designated folders. New files must only be created in specified directories. Cursor must NOT create duplicate folders or components in incorrect locations."
+    },
+    "security": {
+      "rules": [
+        "Implement a whitelist-based approach for indexing directories. Directories must be explicitly added by users before indexing begins.",
+        "Exclude sensitive directories by default (e.g., /proc, /sys, C:\\Windows, ~/Library).",
+        "Encrypt all communication between the frontend and backend using Tauri’s secure IPC (Inter-Process Communication).",
+        "Sanitize all user inputs to prevent potential injection attacks.",
+        "Limit file system access to the user's configured directories and provide clear error messages for unauthorized access.",
+        "Store logs and temporary files securely in platform-appropriate locations (e.g., ~/.logs/ or %APPDATA%\\Logs\\).",
+        "Conduct regular security audits to identify vulnerabilities in file parsing and API communication."
+      ]
+    },
+    "features": {
+      "indexing_and_search": {
+        "description": "Provide advanced, instant search capabilities for indexed files.",
+        "capabilities": [
+          "Full-text search using Tantivy.",
+          "Regex support for advanced queries.",
+          "Filters by file type, size, and modification date.",
+          "Real-time updates to the index as files are added, modified, or deleted.",
+          "Autocomplete suggestions for frequently searched terms."
+        ]
+      },
+      "ui_features": {
+        "description": "A modern and responsive UI for interacting with the file system.",
+        "capabilities": [
+          "Dynamic real-time search results.",
+          "Visual filters and sorting options.",
+          "A directory picker to configure which folders are indexed.",
+          "Detailed file previews for supported formats (e.g., PDFs, text files).",
+          "Usage analytics and search statistics for advanced users."
+        ]
+      },
+      "backend_features": {
+        "description": "High-performance Rust backend handling file system operations and indexing.",
+        "capabilities": [
+          "Recursive file system traversal with efficient multithreading.",
+          "Tantivy-based indexing for optimized storage and retrieval.",
+          "File content parsing for text and binary formats (e.g., PDF, DOCX).",
+          "Incremental indexing to minimize resource usage.",
+          "API endpoints exposed to the frontend via Tauri."
+        ]
+      },
+      "performance": {
+        "priorities": ["Speed", "Efficiency", "Minimal resource usage"],
+        "execution_strategy": "Favor speed over all else, optimizing caching and compression where applicable."
+      }
+    },
+    "cleanup_and_iteration": {
+      "rules": [
+        "Cursor must iterate over the codebase regularly to identify and remove unused files.",
+        "Obsolete files or folders must be flagged and confirmed before deletion.",
+        "Temporary files created during indexing or search operations must be cleaned immediately after use."
+      ]
+    },
+    "custom_code_protection": [
+      {
+        "pattern": "const nextjs15 = await params;",
+        "rule": "Do not change or remove."
+      }
+    ],
+    "error_handling": {
+      "rules": [
+        "Log all skipped files with reasons (e.g., permission errors, unsupported formats).",
+        "Provide user-friendly feedback for errors in both the frontend and backend.",
+        "Ensure that the system fails gracefully in case of critical errors, preserving data integrity."
+      ]
+    },
+    "dependencies": {
+      "latest_versions": true,
+      "cache_policy": "Always prefer cached data over unstale cache functions."
+    },
+    "logging_and_metrics": {
+      "metrics": [
+        "Track the number of indexed files.",
+        "Monitor index size and query performance.",
+        "Log frequently used search patterns for optimization."
+      ],
+      "log_locations": {
+        "Linux_macOS": "~/.logs/",
+        "Windows": "%APPDATA%\\Logs\\"
+      }
+    },
+    "compatibility": {
+      "hardware": "Optimize for both high-performance and low-resource machines.",
+      "backward_compatibility": "Ensure functionality on older operating systems and hardware configurations."
+    }
+  }
+}
