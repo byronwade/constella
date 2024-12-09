@@ -48,11 +48,29 @@ struct IndexingState {
 impl IndexManager {
     pub fn new() -> tantivy::Result<Self> {
         let mut schema_builder = Schema::builder();
-        schema_builder.add_text_field("path", TEXT | STORED);
-        schema_builder.add_text_field("content", TEXT);
+        
+        // Add all required fields with proper options
+        schema_builder.add_text_field("path", TEXT | STORED | FAST);
+        schema_builder.add_text_field("name", TEXT | STORED | FAST);
+        schema_builder.add_text_field("file_type", TEXT | STORED | FAST);
+        schema_builder.add_text_field("size", STORED);
+        schema_builder.add_text_field("modified", STORED);
+        schema_builder.add_text_field("content", TEXT | STORED);  // Added STORED flag
+        schema_builder.add_text_field("trigrams", TEXT | FAST);
+        schema_builder.add_text_field("file_extension", TEXT | STORED | FAST);
+        
         let schema = schema_builder.build();
 
-        let index = Index::create_in_ram(schema.clone());
+        // Create index on disk instead of RAM
+        let app_data_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
+            .ok_or_else(|| tantivy::TantivyError::SystemError("Failed to get app data directory".to_string()))?;
+        let index_path = app_data_dir.join("index");
+        std::fs::create_dir_all(&index_path)
+            .map_err(|e| tantivy::TantivyError::SystemError(format!("Failed to create index directory: {}", e)))?;
+        
+        let index = Index::create_in_dir(&index_path, schema.clone())
+            .map_err(|e| tantivy::TantivyError::SystemError(format!("Failed to create index: {}", e)))?;
+        
         let writer = index.writer(50_000_000)?; // 50MB buffer
 
         Ok(Self {
