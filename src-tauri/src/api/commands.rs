@@ -1,18 +1,18 @@
 use std::path::PathBuf;
-use tauri::{State, AppHandle, Manager};
-use serde::Serialize;
-use log::{info, error};
-use crate::indexing::{IndexManager, IndexingState, SearchDoc};
 use std::sync::Arc;
+use tauri::{State, AppHandle, Manager};
 use tokio::sync::Mutex;
+use log::{info, error};
+use serde::Serialize;
+use crate::indexing::{IndexManager, IndexingState, SearchDoc};
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct IndexingProgress {
     pub total_files: usize,
     pub processed_files: usize,
     pub current_file: String,
-    pub is_complete: bool,
     pub state: String,
+    pub is_complete: bool,
     pub files_found: usize,
     pub start_time: u64,
 }
@@ -45,43 +45,37 @@ pub async fn select_directory() -> Result<String, String> {
 
 #[tauri::command]
 pub async fn start_indexing(
-    path: String,
     state: State<'_, Arc<Mutex<IndexManager>>>,
     app_handle: AppHandle,
+    path: String,
 ) -> Result<(), String> {
-    info!("start_indexing: Starting directory indexing...");
-    
-    // Initial progress update with current timestamp
     let start_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-        
-    let progress = IndexingProgress {
-        total_files: 0,
-        processed_files: 0,
-        current_file: "Starting scan...".to_string(),
-        is_complete: false,
-        state: "Scanning".to_string(),
-        files_found: 0,
-        start_time,
-    };
-    
-    if let Err(e) = app_handle.emit_all("indexing-progress", progress) {
-        error!("Failed to emit initial progress: {}", e);
-    }
-    
-    // Clone necessary data for the background task
-    let state_clone = state.clone();
-    let app_handle_clone = app_handle.clone();
-    let path_clone = path.clone();
 
-    // Spawn background task
+    // Create a channel for progress updates
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(32);
+    let app_handle_for_updates = app_handle.clone();
+
+    // Spawn a task to handle progress updates
     tokio::spawn(async move {
-        // Get the inner IndexManager and lock it
-        let index_manager = state_clone.lock().await;
-        
-        // Create progress callback that includes yield points
+        while let Some(progress) = progress_rx.recv().await {
+            if let Err(e) = app_handle_for_updates.emit_all("indexing-progress", progress) {
+                error!("Failed to emit progress: {}", e);
+            }
+        }
+    });
+
+    // Clone necessary data for the background task
+    let index_manager = Arc::clone(&state.inner());
+    let app_handle_for_errors = app_handle;
+    let path_clone = path;
+    let progress_tx = Arc::new(progress_tx);
+
+    // Spawn the indexing task
+    tokio::spawn(async move {
+        let progress_tx = Arc::clone(&progress_tx);
         let progress_callback = move |state: &IndexingState| {
             let progress = IndexingProgress {
                 total_files: state.total_files,
@@ -90,20 +84,19 @@ pub async fn start_indexing(
                 is_complete: state.is_complete,
                 state: state.state.clone(),
                 files_found: state.files_found,
-                start_time: state.start_time,
+                start_time,
             };
             
-            if let Err(e) = app_handle_clone.emit_all("indexing-progress", progress) {
-                error!("Failed to emit indexing progress: {}", e);
+            if let Err(e) = progress_tx.try_send(progress) {
+                error!("Failed to send progress update: {}", e);
             }
-
-            // Yield to allow other tasks to run
-            tokio::task::yield_now();
         };
-        
-        // Start indexing in background
-        if let Err(e) = index_manager.start_indexing(PathBuf::from(path_clone), progress_callback).await {
+
+        // Start indexing
+        let mut index_manager = index_manager.lock().await;
+        if let Err(e) = (&mut *index_manager).start_indexing(PathBuf::from(path_clone), progress_callback).await {
             error!("Indexing failed: {}", e);
+            
             // Send error progress
             let error_progress = IndexingProgress {
                 total_files: 0,
@@ -114,7 +107,8 @@ pub async fn start_indexing(
                 files_found: 0,
                 start_time,
             };
-            if let Err(e) = app_handle_clone.emit_all("indexing-progress", error_progress) {
+            
+            if let Err(e) = app_handle_for_errors.emit_all("indexing-progress", error_progress) {
                 error!("Failed to emit error progress: {}", e);
             }
         }
@@ -130,7 +124,7 @@ pub async fn search_files(
 ) -> Result<Vec<SearchDoc>, String> {
     info!("search_files: Executing search query: {}", query);
     let index_manager = state.lock().await;
-    let results = index_manager.search(&query).await?;
+    let results = (&*index_manager).search(&query).await?;
     Ok(results)
 }
 
@@ -138,12 +132,6 @@ pub async fn search_files(
 pub async fn verify_index(
     state: State<'_, Arc<Mutex<IndexManager>>>,
 ) -> Result<String, String> {
-    info!("verify_index: Starting index verification");
     let index_manager = state.lock().await;
-    let result = index_manager.verify_index().await;
-    match &result {
-        Ok(msg) => info!("verify_index: Verification successful: {}", msg),
-        Err(e) => error!("verify_index: Verification failed: {}", e),
-    }
-    result
+    (&*index_manager).verify_index().await
 } 

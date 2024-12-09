@@ -1,3 +1,6 @@
+https://doc.rust-lang.org/beta/std/index.html
+
+
 `**Constella: A Next-Gen Cross-Platform File System Search & Indexing Tool**
 ===========================================================================
 
