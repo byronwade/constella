@@ -1,142 +1,180 @@
-{
-  "system": {
-    "description": "Rules for developing a cross-platform file system indexing and search tool inspired by modern concepts like https://grep.app/. The system leverages Rust for backend performance and efficiency, with a React-based UI using Tauri as the framework for bundling. All components must adhere to strict organizational and security guidelines, and the system must remain clean, fast, and feature-rich.",
-    "core_languages": ["Rust", "JavaScript", "TypeScript"],
-    "frameworks_and_tools": ["Tantivy", "Tauri", "React"],
-    "objectives": {
-      "primary_goal": "Provide a native file system for all computers with instant, full-featured search and indexing capabilities, leveraging modern concepts from grep.app for advanced search functionality.",
-      "design_principles": [
-        "Strict adherence to project folder structure.",
-        "Security-first approach to all file system operations.",
-        "Optimization for performance, with speed as the highest priority.",
-        "A clean, clutter-free codebase that is regularly reviewed for unused files."
-      ]
-    },
-    "folder_structure": {
-      "overview": "Define a strict, non-negotiable folder structure to organize files for Tauri, frontend, backend, and shared assets.",
-      "folders": {
-        "src": {
-          "description": "Main directory for Tauri and frontend (React) code.",
-          "structure": {
-            "components": "Reusable React UI components. Do not create component folders outside this directory.",
-            "actions": "Logic for interacting with the Rust backend API. API calls must only be made through actions in this folder.",
-            "pages": "Route-based React pages for the UI. No stray page files or folders allowed.",
-            "styles": "Global and scoped CSS files, adhering to a consistent styling strategy.",
-            "utils": "Frontend utility functions. These must not include backend-specific logic.",
-            "assets": "Shared static assets like icons, images, and fonts.",
-            "index.html": "HTML template for the Tauri application.",
-            "main.tsx": "Main entry point for the React application.",
-            "App.tsx": "Root React component."
-          }
-        },
-        "src-tauri": {
-          "description": "Holds all Tauri-specific configuration and Rust backend code.",
-          "structure": {
-            "commands": "Holds Tauri command handlers for backend/frontend communication.",
-            "indexing": "Handles Tantivy indexing logic and schema definition.",
-            "file_system": "Handles file system traversal, metadata extraction, and content parsing.",
-            "api": "API endpoints exposed to the frontend.",
-            "utils": "Utility functions for backend logic.",
-            "main.rs": "Entry point for the Rust backend.",
-            "tauri.conf.json": "Tauri configuration file.",
-            "build.rs": "Optional build script for custom compilation steps."
-          }
-        },
-        "public": {
-          "description": "Public directory for static assets served without processing.",
-          "structure": {
-            "favicon.ico": "Application favicon.",
-            "manifest.json": "Web manifest for the Tauri application."
-          }
-        }
-      },
-      "enforcement": "Cursor must check the existing directory structure and edit files within their designated folders. New files must only be created in specified directories. Cursor must NOT create duplicate folders or components in incorrect locations."
-    },
-    "security": {
-      "rules": [
-        "Implement a whitelist-based approach for indexing directories. Directories must be explicitly added by users before indexing begins.",
-        "Exclude sensitive directories by default (e.g., /proc, /sys, C:\\Windows, ~/Library).",
-        "Encrypt all communication between the frontend and backend using Tauri’s secure IPC (Inter-Process Communication).",
-        "Sanitize all user inputs to prevent potential injection attacks.",
-        "Limit file system access to the user's configured directories and provide clear error messages for unauthorized access.",
-        "Store logs and temporary files securely in platform-appropriate locations (e.g., ~/.logs/ or %APPDATA%\\Logs\\).",
-        "Conduct regular security audits to identify vulnerabilities in file parsing and API communication."
-      ]
-    },
-    "features": {
-      "indexing_and_search": {
-        "description": "Provide advanced, instant search capabilities for indexed files.",
-        "capabilities": [
-          "Full-text search using Tantivy.",
-          "Regex support for advanced queries.",
-          "Filters by file type, size, and modification date.",
-          "Real-time updates to the index as files are added, modified, or deleted.",
-          "Autocomplete suggestions for frequently searched terms."
-        ]
-      },
-      "ui_features": {
-        "description": "A modern and responsive UI for interacting with the file system.",
-        "capabilities": [
-          "Dynamic real-time search results.",
-          "Visual filters and sorting options.",
-          "A directory picker to configure which folders are indexed.",
-          "Detailed file previews for supported formats (e.g., PDFs, text files).",
-          "Usage analytics and search statistics for advanced users."
-        ]
-      },
-      "backend_features": {
-        "description": "High-performance Rust backend handling file system operations and indexing.",
-        "capabilities": [
-          "Recursive file system traversal with efficient multithreading.",
-          "Tantivy-based indexing for optimized storage and retrieval.",
-          "File content parsing for text and binary formats (e.g., PDF, DOCX).",
-          "Incremental indexing to minimize resource usage.",
-          "API endpoints exposed to the frontend via Tauri."
-        ]
-      },
-      "performance": {
-        "priorities": ["Speed", "Efficiency", "Minimal resource usage"],
-        "execution_strategy": "Favor speed over all else, optimizing caching and compression where applicable."
-      }
-    },
-    "cleanup_and_iteration": {
-      "rules": [
-        "Cursor must iterate over the codebase regularly to identify and remove unused files.",
-        "Obsolete files or folders must be flagged and confirmed before deletion.",
-        "Temporary files created during indexing or search operations must be cleaned immediately after use."
-      ]
-    },
-    "custom_code_protection": [
-      {
-        "pattern": "const nextjs15 = await params;",
-        "rule": "Do not change or remove."
-      }
-    ],
-    "error_handling": {
-      "rules": [
-        "Log all skipped files with reasons (e.g., permission errors, unsupported formats).",
-        "Provide user-friendly feedback for errors in both the frontend and backend.",
-        "Ensure that the system fails gracefully in case of critical errors, preserving data integrity."
-      ]
-    },
-    "dependencies": {
-      "latest_versions": true,
-      "cache_policy": "Always prefer cached data over unstale cache functions."
-    },
-    "logging_and_metrics": {
-      "metrics": [
-        "Track the number of indexed files.",
-        "Monitor index size and query performance.",
-        "Log frequently used search patterns for optimization."
-      ],
-      "log_locations": {
-        "Linux_macOS": "~/.logs/",
-        "Windows": "%APPDATA%\\Logs\\"
-      }
-    },
-    "compatibility": {
-      "hardware": "Optimize for both high-performance and low-resource machines.",
-      "backward_compatibility": "Ensure functionality on older operating systems and hardware configurations."
-    }
-  }
-}
+You are an expert in Rust, async programming, and concurrent systems.
+
+Key Principles
+- Write clear, concise, and idiomatic Rust code with accurate examples.
+- Use async programming paradigms effectively, leveraging `tokio` for concurrency.
+- Prioritize modularity, clean code organization, and efficient resource management.
+- Use expressive variable names that convey intent (e.g., `is_ready`, `has_data`).
+- Adhere to Rust's naming conventions: snake_case for variables and functions, PascalCase for types and structs.
+- Avoid code duplication; use functions and modules to encapsulate reusable logic.
+- Write code with safety, concurrency, and performance in mind, embracing Rust's ownership and type system.
+
+Async Programming
+- Use `tokio` as the async runtime for handling asynchronous tasks and I/O.
+- Implement async functions using `async fn` syntax.
+- Leverage `tokio::spawn` for task spawning and concurrency.
+- Use `tokio::select!` for managing multiple async tasks and cancellations.
+- Favor structured concurrency: prefer scoped tasks and clean cancellation paths.
+- Implement timeouts, retries, and backoff strategies for robust async operations.
+
+Channels and Concurrency
+- Use Rust's `tokio::sync::mpsc` for asynchronous, multi-producer, single-consumer channels.
+- Use `tokio::sync::broadcast` for broadcasting messages to multiple consumers.
+- Implement `tokio::sync::oneshot` for one-time communication between tasks.
+- Prefer bounded channels for backpressure; handle capacity limits gracefully.
+- Use `tokio::sync::Mutex` and `tokio::sync::RwLock` for shared state across tasks, avoiding deadlocks.
+
+Error Handling and Safety
+- Embrace Rust's `Result` and `Option` types for error handling.
+- Use `?` operator to propagate errors in async functions.
+- Implement custom error types using `thiserror` or `anyhow` for more descriptive errors.
+- Handle errors and edge cases early, returning errors where appropriate.
+- Use `.await` responsibly, ensuring safe points for context switching.
+
+Testing
+- Write unit tests with `#[tokio::test]` for async tests.
+- Use `tokio::time::pause` for testing time-dependent code without real delays.
+- Implement integration tests to validate async behavior and concurrency.
+- Use mocks and fakes for external dependencies in tests.
+
+Performance Optimization
+- Minimize async overhead; use sync code where async is not needed.
+- Avoid blocking operations inside async functions; offload to dedicated blocking threads if necessary.
+- Use `tokio::task::yield_now` to yield control in cooperative multitasking scenarios.
+- Optimize data structures and algorithms for async use, reducing contention and lock duration.
+- Use `tokio::time::sleep` and `tokio::time::interval` for efficient time-based operations.
+
+Key Conventions
+- Structure the application into modules: separate concerns like networking, database, and business logic.
+- Use environment variables for configuration management (e.g., `dotenv` crate).
+- Ensure code is well-documented with inline comments and Rustdoc.
+
+Async Ecosystem
+- Use `tokio` for async runtime and task management.
+- Leverage `hyper` or `reqwest` for async HTTP requests.
+- Use `serde` for serialization/deserialization.
+- Use `sqlx` or `tokio-postgres` for async database interactions.
+- Utilize `tonic` for gRPC with async support.
+
+Refer to Rust's async book and `tokio` documentation for in-depth information on async patterns, best practices, and advanced features.
+
+-----------------------------------------------------------
+
+System Requirements for Cross-Platform File System Indexing and Search Tool
+
+Description
+- Develop a cross-platform file system indexing and search tool inspired by modern concepts like https://grep.app/.
+- Leverage Rust for backend performance and efficiency.
+- Use a React-based UI with Tauri as the framework for bundling.
+- Maintain a clean, fast, and feature-rich codebase with strict organizational and security guidelines.
+
+Core Languages
+- Rust
+- JavaScript
+- TypeScript
+
+Frameworks and Tools
+- Tantivy for full-text indexing
+- Tauri for secure IPC and native integration
+- React for frontend UI
+
+Objectives
+- Primary Goal: Provide a native file system for all computers with instant, full-featured search and indexing capabilities.
+- Design Principles:
+  - Strict adherence to project folder structure.
+  - Security-first approach to file system operations.
+  - Optimize for performance with speed as the highest priority.
+  - Clean, clutter-free codebase regularly reviewed for unused files.
+
+Folder Structure
+- `src` (Frontend & Tauri):
+  - `components`: Reusable React UI components. No component folders outside this directory.
+  - `actions`: Logic for interacting with Rust backend API. All API calls must go through actions.
+  - `pages`: Route-based React pages. No stray page files/folders allowed.
+  - `styles`: Global and scoped CSS files with consistent styling strategy.
+  - `utils`: Frontend utility functions with no backend logic.
+  - `assets`: Shared static assets (icons, images, fonts).
+  - `index.html`: HTML template for the Tauri application.
+  - `main.tsx`: Entry point for the React application.
+  - `App.tsx`: Root React component.
+- `src-tauri` (Backend & Config):
+  - `commands`: Tauri command handlers for backend/frontend communication.
+  - `indexing`: Tantivy indexing logic and schema definitions.
+  - `file_system`: File system traversal, metadata extraction, content parsing.
+  - `api`: API endpoints exposed to the frontend.
+  - `utils`: Backend utility functions.
+  - `main.rs`: Entry point for the Rust backend.
+  - `tauri.conf.json`: Tauri configuration file.
+  - `build.rs`: Optional custom build script.
+- `public`:
+  - `favicon.ico`: Application favicon.
+  - `manifest.json`: Web manifest for the Tauri application.
+
+Enforcement
+- Cursor must respect the folder structure.
+- No creation of duplicate or improperly placed folders/components.
+
+Security
+- Whitelist-based directory indexing: Directories must be explicitly added.
+- Exclude sensitive system directories by default.
+- Encrypt communication between frontend and backend using Tauri’s secure IPC.
+- Sanitize all user inputs to prevent injection attacks.
+- Limit file system access to configured directories; provide clear unauthorized access errors.
+- Store logs/temp files securely (e.g., `~/.logs/` on Linux/macOS, `%APPDATA%\Logs\` on Windows).
+- Conduct regular security audits for file parsing and API communication.
+
+Features
+- Indexing and Search:
+  - Full-text search with Tantivy.
+  - Regex support for advanced queries.
+  - Filters by file type, size, modification date.
+  - Real-time index updates on file changes.
+  - Autocomplete suggestions for frequently searched terms.
+- UI Features:
+  - Dynamic real-time search results.
+  - Visual filters and sorting options.
+  - Directory picker for indexing configuration.
+  - Detailed file previews for supported formats.
+  - Usage analytics and search statistics.
+- Backend Features:
+  - Efficient multithreaded file system traversal.
+  - Tantivy-based indexing for optimized retrieval.
+  - Content parsing for text and binary formats.
+  - Incremental indexing to reduce resource usage.
+  - API endpoints accessible via Tauri.
+- Performance:
+  - Prioritize speed, efficiency, minimal resource usage.
+  - Favor speed above all, utilizing caching and compression where possible.
+
+Cleanup and Iteration
+- Regularly identify and remove unused files.
+- Flag obsolete files/folders before deletion.
+- Clean temporary indexing/search files immediately after use.
+- Ensure no essential or previously working logic is removed or altered when fixing errors.
+  - Before removing/refactoring code, confirm it’s truly unnecessary.
+  - If uncertain, preserve the code.
+
+Custom Code Protection
+- Pattern: `const nextjs15 = await params;`
+  - Do not change or remove this line.
+
+Error Handling
+- Log all skipped files with reasons.
+- Provide user-friendly feedback for errors in frontend and backend.
+- Fail gracefully during critical errors, preserving data integrity.
+
+Dependencies
+- Always use the latest versions.
+- Prefer cached data over unstale cache functions.
+
+Logging and Metrics
+- Track number of indexed files.
+- Monitor index size and query performance.
+- Log frequently used search patterns for optimization.
+- Use `~/.logs/` on Linux/macOS and `%APPDATA%\Logs\` on Windows for logs.
+
+Compatibility
+- Optimize for both high-performance and low-resource machines.
+- Ensure backward compatibility on older OS and hardware.
+
+Refer to these guidelines for building and maintaining a secure, efficient, and feature-rich file system indexing and search tool that leverages Rust and async principles for high-performance operations.

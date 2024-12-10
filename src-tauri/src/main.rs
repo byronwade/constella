@@ -2,28 +2,29 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tauri::{CustomMenuItem, Menu, Submenu};
+use tauri::{CustomMenuItem, Menu, Submenu, Manager};
 use crate::indexing::IndexManager;
 use env_logger;
-use log::{LevelFilter, info, error};
+use log::{LevelFilter, info, debug};
 use chrono;
 
-mod api;
-mod file_system;
-mod indexing;
-mod utils;
+pub mod api;
+pub mod file_system;
+pub mod indexing;
+pub mod utils;
+pub mod benchmarking;
 
 pub struct AppState {
-    pub index_manager: Arc<Mutex<IndexManager>>,
+    pub indexer: Arc<Mutex<IndexManager>>,
+    pub app_handle: Arc<tauri::AppHandle>,
 }
 
 impl AppState {
-    async fn new() -> Result<Self, String> {
-        let index_manager = IndexManager::new().await?;
-        
-        Ok(Self {
-            index_manager: Arc::new(Mutex::new(index_manager)),
-        })
+    pub fn new(indexer: IndexManager, app_handle: tauri::AppHandle) -> Self {
+        Self {
+            indexer: Arc::new(Mutex::new(indexer)),
+            app_handle: Arc::new(app_handle),
+        }
     }
 }
 
@@ -40,27 +41,31 @@ async fn main() {
         .format(|buf, record| {
             use std::io::Write;
             writeln!(buf,
-                "[{} {} {}:{}] {}",
+                "[{} {} {} {}:{}] {}",
                 chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
                 record.level(),
+                record.target(),
                 record.file().unwrap_or("unknown"),
                 record.line().unwrap_or(0),
                 record.args()
             )
         })
         .filter_level(LevelFilter::Debug)
+        .filter_module("constella", LevelFilter::Debug)
+        .filter_module("tantivy", LevelFilter::Info)
+        .filter_module("ignore", LevelFilter::Info)
         .init();
 
-    info!("Starting Constella application");
-    info!("Initializing Tauri builder");
+    debug!("Starting Constella application with debug logging enabled");
+    
+    // Create index manager first
+    let index_manager = IndexManager::new()
+        .await
+        .expect("Failed to create index manager");
 
-    let app_state = match AppState::new().await {
-        Ok(state) => state,
-        Err(e) => {
-            error!("Failed to create application state: {}", e);
-            std::process::exit(1);
-        }
-    };
+    debug!("Index manager created successfully");
+
+    info!("Initializing Tauri builder");
 
     tauri::Builder::default()
         .menu(create_context_menu())
@@ -85,11 +90,37 @@ async fn main() {
                 _ => {}
             }
         })
-        .setup(|_app| {
+        .setup(|app| {
             info!("Running Tauri setup");
+            
+            let main_window = app.get_window("main")
+                .unwrap_or_else(|| {
+                    tauri::WindowBuilder::new(
+                        app,
+                        "main",
+                        tauri::WindowUrl::App("index.html".into())
+                    )
+                    .title("Constella")
+                    .inner_size(800.0, 600.0)
+                    .build()
+                    .expect("Failed to create main window")
+                });
+            
+            // Handle window close event
+            let window_clone = main_window.clone();
+            main_window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { .. } = event {
+                    info!("Window close requested - hiding window");
+                    let _ = window_clone.hide();
+                }
+            });
+            
+            // Create app state
+            let state = AppState::new(index_manager, app.handle());
+            app.manage(state);
+            
             Ok(())
         })
-        .manage(app_state.index_manager.clone())
         .invoke_handler(tauri::generate_handler![
             api::commands::select_directory,
             api::commands::start_indexing,

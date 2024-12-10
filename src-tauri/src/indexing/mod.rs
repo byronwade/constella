@@ -1,17 +1,36 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Instant, Duration};
+use std::collections::HashSet;
+use std::fs;
+use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+use crossbeam_channel::bounded;
+use parking_lot::RwLock;
+use num_cpus;
+
+use log::{info, warn, debug, error};
 use tokio::sync::Mutex;
 use tantivy::{Index, IndexWriter, schema::*, Document};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::directory::MmapDirectory;
-use log::{info, warn, error, debug};
-use std::fs;
-use std::collections::HashSet;
-use std::time::Instant;
-use crate::file_system::{FileSystem, FileInfo};
 use serde::Serialize;
-use futures::future;
+use crate::file_system::FileInfo;
+
+// Performance-optimized constants
+const COMMIT_BATCH_SIZE: usize = 100_000; // Reduced for more frequent commits
+const INDEX_BUFFER_SIZE: usize = 2_000_000_000; // 2GB buffer for better memory usage
+const CHANNEL_SIZE: usize = 1_000_000; // Reduced channel size
+const PROGRESS_UPDATE_INTERVAL: u64 = 500; // Increased to reduce overhead
+const PROCESSOR_BATCH_SIZE: usize = 10_000; // Reduced batch size
+const MAX_CONCURRENT_INDEXERS: usize = 4; // Reduced for better resource usage
+const MAX_CONCURRENT_SCANNERS: usize = 1; // Single scanner to reduce contention
+const SCAN_QUEUE_SIZE: usize = 50_000; // Reduced queue size
+const SCAN_BATCH_SIZE: usize = 500; // Smaller batches
+const SCAN_YIELD_THRESHOLD: usize = 5_000; // More frequent yields
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(15); // Reduced timeout
+const ERROR_RETRY_DELAY: Duration = Duration::from_millis(100); // New constant for error retries
+const MAX_ERROR_RETRIES: usize = 3; // New constant for max retries
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchDoc {
@@ -36,10 +55,38 @@ pub struct IndexingState {
     pub total_files: usize,
     pub processed_files: usize,
     pub current_file: String,
-    pub state: String,
     pub is_complete: bool,
+    pub state: String,
     pub files_found: usize,
     pub start_time: u64,
+    pub speed: u64,
+    pub phase: String,
+}
+
+impl Default for IndexingState {
+    fn default() -> Self {
+        Self {
+            total_files: 0,
+            processed_files: 0,
+            current_file: String::new(),
+            is_complete: false,
+            state: "Initializing".to_string(),
+            files_found: 0,
+            start_time: 0,
+            speed: 0,
+            phase: "Scanning".to_string(),
+        }
+    }
+}
+
+pub struct IndexManager {
+    schema: Schema,
+    index: Index,
+    writer: Arc<Mutex<IndexWriter>>,
+    fields: SchemaFields,
+    state: Arc<RwLock<IndexingState>>,
+    indexed_paths: Arc<RwLock<HashSet<String>>>,
+    buffer_size: usize,
 }
 
 #[derive(Clone)]
@@ -52,15 +99,6 @@ pub struct SchemaFields {
     pub created: Field,
     pub mime_type: Field,
     pub extension: Field,
-}
-
-pub struct IndexManager {
-    schema: Schema,
-    index: Arc<Index>,
-    writer: Arc<Mutex<IndexWriter>>,
-    fields: SchemaFields,
-    indexing_state: Arc<Mutex<IndexingState>>,
-    indexed_paths: Arc<Mutex<HashSet<String>>>,
 }
 
 impl IndexManager {
@@ -110,10 +148,10 @@ impl IndexManager {
         let index = Index::open_or_create(dir, schema.clone())
             .map_err(|e| format!("Failed to create/open index: {}", e))?;
             
-        let writer = index.writer(50_000_000)
+        let writer = index.writer(INDEX_BUFFER_SIZE)
             .map_err(|e| format!("Failed to create index writer: {}", e))?;
             
-        let indexing_state = Arc::new(Mutex::new(IndexingState {
+        let state = Arc::new(RwLock::new(IndexingState {
             total_files: 0,
             processed_files: 0,
             current_file: String::new(),
@@ -124,184 +162,574 @@ impl IndexManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64,
+            speed: 0,
+            phase: "Scanning".to_string(),
         }));
         
         Ok(Self {
             schema,
-            index: Arc::new(index),
+            index,
             writer: Arc::new(Mutex::new(writer)),
             fields,
-            indexing_state,
-            indexed_paths: Arc::new(Mutex::new(HashSet::new())),
+            state,
+            indexed_paths: Arc::new(RwLock::new(HashSet::new())),
+            buffer_size: INDEX_BUFFER_SIZE,
         })
+    }
+
+    // Helper function to prepare document
+    fn prepare_document(fields: &SchemaFields, file_info: &FileInfo) -> Document {
+        let mut doc = Document::new();
+        
+        // Fast document preparation with capacity hints
+        doc.add_text(fields.path, file_info.path.to_string_lossy().to_string());
+        doc.add_text(fields.name, &file_info.name);
+        doc.add_text(fields.size, file_info.size.to_string());
+        
+        if let Some(mime) = &file_info.mime_type {
+            doc.add_text(fields.mime_type, mime);
+        }
+        
+        if let Some(modified) = &file_info.modified {
+            if let Ok(modified_str) = modified.duration_since(std::time::UNIX_EPOCH) {
+                doc.add_text(fields.modified, modified_str.as_secs().to_string());
+            }
+        }
+        
+        doc
+    }
+
+    fn prepare_document_batch(fields: &SchemaFields, file_infos: &[FileInfo]) -> Vec<Document> {
+        file_infos.iter().map(|file_info| {
+            let mut doc = Document::new();
+            
+            // Fast document preparation without allocations
+            doc.add_text(fields.path, file_info.path.to_string_lossy());
+            doc.add_text(fields.name, &file_info.name);
+            doc.add_text(fields.size, file_info.size.to_string());
+            
+            if let Some(mime) = &file_info.mime_type {
+                doc.add_text(fields.mime_type, mime);
+            }
+            
+            if let Some(modified) = &file_info.modified {
+                if let Ok(modified_str) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    doc.add_text(fields.modified, modified_str.as_secs().to_string());
+                }
+            }
+            
+            doc
+        }).collect()
     }
 
     pub async fn start_indexing<F>(&mut self, directory: PathBuf, progress_callback: F) -> Result<(), String>
     where
-        F: Fn(&IndexingState) + Send + Sync + 'static + Clone,
+        F: Fn(&IndexingState) + Send + Sync + Clone + 'static,
     {
+        debug!("Starting optimized indexing for directory: {:?}", directory);
         let start_time = Instant::now();
-        info!("Starting indexing for directory: {:?}", directory);
         
-        // Reset indexing state
-        let mut state = self.indexing_state.lock().await;
-        state.total_files = 0;
-        state.processed_files = 0;
-        state.current_file = String::new();
-        state.is_complete = false;
-        state.state = "Scanning".to_string();
-        state.files_found = 0;
-        drop(state);
+        let (tx, rx) = bounded::<Vec<FileInfo>>(SCAN_QUEUE_SIZE);
+        let (doc_tx, doc_rx) = bounded::<Vec<Document>>(SCAN_QUEUE_SIZE);
         
-        // Create new file system scanner
-        let fs = FileSystem::new();
+        let processed_count = Arc::new(AtomicUsize::new(0));
+        let total_count = Arc::new(AtomicUsize::new(0));
+        let phase = Arc::new(RwLock::new(String::from("Scanning")));
+        let error_count = Arc::new(AtomicUsize::new(0));
+        let is_complete = Arc::new(AtomicBool::new(false));
+        let should_stop = Arc::new(AtomicBool::new(false));
         
-        info!("Scanning directory for files...");
-        let scan_start = Instant::now();
-        
-        // Clone necessary references for the closure
-        let indexing_state = Arc::clone(&self.indexing_state);
-        let progress_callback_scan = progress_callback.clone();
-        
-        let files = fs.scan_directory(&directory, move |count| {
-            let mut state = futures::executor::block_on(indexing_state.lock());
-            state.files_found = count;
-            progress_callback_scan(&state);
-        }).await?;
-        
-        let scan_duration = scan_start.elapsed();
-        info!("Directory scan completed in {:.2}s, found {} files", 
-              scan_duration.as_secs_f32(), 
-              files.len());
-        
-        // Update total files count
-        let mut state = self.indexing_state.lock().await;
-        state.total_files = files.len();
-        state.state = "Indexing".to_string();
-        progress_callback(&state);
-        drop(state);
-        
-        // Process files in chunks
-        let chunk_size = 1000;
-        let total_chunks = (files.len() + chunk_size - 1) / chunk_size;
-        let chunks: Vec<_> = files.chunks(chunk_size).collect();
-        
-        for (chunk_index, chunk) in chunks.into_iter().enumerate() {
-            let chunk_start = Instant::now();
-            info!("Processing chunk {}/{}", chunk_index + 1, total_chunks);
+        // Memory-efficient progress tracking
+        let progress_handle = {
+            let progress_callback = progress_callback.clone();
+            let processed_count = Arc::clone(&processed_count);
+            let total_count = Arc::clone(&total_count);
+            let phase = Arc::clone(&phase);
+            let error_count = Arc::clone(&error_count);
+            let start = start_time.clone();
+            let should_stop = Arc::clone(&should_stop);
             
-            // Process chunk in parallel using futures
-            let mut docs = Vec::new();
-            let mut futures = Vec::new();
-            
-            for file_info in chunk {
-                // Update current file in state
-                let mut state = self.indexing_state.lock().await;
-                state.current_file = file_info.path.to_string_lossy().to_string();
-                state.processed_files += 1;
-                progress_callback(&state);
-                drop(state);
+            tokio::spawn(async move {
+                let mut last_processed = 0;
+                let mut last_time = Instant::now();
+                let mut consecutive_same_count = 0;
+                let mut last_error_count = 0;
                 
-                // Index the file
-                futures.push(self.index_file(file_info));
-            }
-            
-            // Wait for all files in chunk to be processed
-            for result in future::join_all(futures).await {
-                match result {
-                    Ok(doc) => docs.push(doc),
-                    Err(e) => error!("Failed to index file: {}", e),
-                }
-            }
-            
-            // Add documents to index
-            let mut writer = self.writer.lock().await;
-            for doc in docs {
-                if let Err(e) = writer.add_document(doc) {
-                    error!("Failed to add document to index: {}", e);
-                }
-            }
-            
-            // Commit after each chunk
-            if let Err(e) = writer.commit() {
-                error!("Failed to commit chunk: {}", e);
-            }
-            
-            let chunk_duration = chunk_start.elapsed();
-            info!("Chunk processed in {:.2}s", chunk_duration.as_secs_f32());
-        }
-        
-        // Mark as complete
-        let mut state = self.indexing_state.lock().await;
-        state.is_complete = true;
-        state.state = "Complete".to_string();
-        progress_callback(&state);
-        
-        let total_duration = start_time.elapsed();
-        info!("Indexing completed in {:.2}s", total_duration.as_secs_f32());
-        
-        Ok(())
-    }
-
-    async fn index_file(&self, file_info: &FileInfo) -> Result<Document, String> {
-        let mut doc = Document::new();
-        
-        // Add basic file metadata
-        doc.add_text(self.fields.path, file_info.path.to_string_lossy().to_string());
-        doc.add_text(self.fields.name, &file_info.name);
-        doc.add_text(self.fields.size, file_info.size.to_string());
-        
-        // Add time fields with proper error handling
-        if let Some(modified) = file_info.modified {
-            match modified.duration_since(std::time::UNIX_EPOCH) {
-                Ok(duration) => {
-                    doc.add_text(self.fields.modified, duration.as_secs().to_string());
-                },
-                Err(e) => {
-                    warn!("Invalid modification time for {:?}: {}", file_info.path, e);
-                }
-            }
-        }
-        
-        // Handle content based on file type
-        if !file_info.is_dir {
-            let mime_type = file_info.mime_type.as_deref().unwrap_or("application/octet-stream");
-            doc.add_text(self.fields.mime_type, mime_type);
-            
-            // Index content for text files
-            if mime_type.starts_with("text/") || matches!(mime_type, 
-                "application/json" | 
-                "application/javascript" | 
-                "application/xml" |
-                "application/x-yaml" |
-                "application/x-toml"
-            ) {
-                debug!("Indexing text content for {:?} ({})", file_info.path, mime_type);
-                match tokio::fs::read_to_string(&file_info.path).await {
-                    Ok(content) => {
-                        // Skip if content is too large (>10MB)
-                        if content.len() > 10_000_000 {
-                            warn!("Skipping large file content for {:?} ({} bytes)", 
-                                  file_info.path, content.len());
-                        } else {
-                            doc.add_text(self.fields.content, &content);
+                while !should_stop.load(Ordering::Relaxed) {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(PROGRESS_UPDATE_INTERVAL)).await;
+                    
+                    let current_processed = processed_count.load(Ordering::Relaxed);
+                    let current_total = total_count.load(Ordering::Relaxed);
+                    let current_phase = phase.read().clone();
+                    let current_errors = error_count.load(Ordering::Relaxed);
+                    let now = Instant::now();
+                    
+                    // Detect stalls and errors
+                    if current_processed == last_processed {
+                        consecutive_same_count += 1;
+                        if consecutive_same_count > 20 {
+                            warn!("Processing stalled - {} files processed, {} total, {} errors", 
+                                current_processed, current_total, current_errors);
+                            
+                            if current_errors > last_error_count {
+                                warn!("New errors detected during stall");
+                            }
                         }
-                    },
-                    Err(e) => {
-                        warn!("Failed to read content for {:?}: {}", file_info.path, e);
+                    } else {
+                        consecutive_same_count = 0;
+                    }
+                    
+                    // Improved speed calculation with error rate
+                    let elapsed = now.duration_since(last_time).as_secs_f64();
+                    let files_processed = current_processed.saturating_sub(last_processed);
+                    let speed = if elapsed > 0.0 { (files_processed as f64 / elapsed) as u64 } else { 0 };
+                    
+                    let error_rate = if current_processed > 0 {
+                        (current_errors as f64 / current_processed as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+                    
+                    // Enhanced progress state
+                    let state = match current_phase.as_str() {
+                        "Scanning" => format!("Scanning... (found {} files)", current_total),
+                        "Processing" => {
+                            if error_rate > 0.0 {
+                                format!("Processing files ({} files/sec, {:.1}% error rate)", 
+                                    speed, error_rate)
+                            } else {
+                                format!("Processing files ({} files/sec)", speed)
+                            }
+                        }
+                        _ => current_phase.clone(),
+                    };
+                    
+                    progress_callback(&IndexingState {
+                        total_files: current_total,
+                        processed_files: if current_phase == "Processing" { current_processed } else { 0 },
+                        current_file: String::new(),
+                        is_complete: false,
+                        state,
+                        files_found: current_total,
+                        start_time: start.elapsed().as_secs(),
+                        speed,
+                        phase: current_phase,
+                    });
+                    
+                    last_processed = current_processed;
+                    last_time = now;
+                    last_error_count = current_errors;
+                }
+            })
+        };
+        
+        // Optimized document writer with error recovery
+        let writer = self.writer.clone();
+        let writer_handle = tokio::spawn({
+            let should_stop = Arc::clone(&should_stop);
+            let error_count = Arc::clone(&error_count);
+            
+            async move {
+                let mut current_batch = Vec::with_capacity(COMMIT_BATCH_SIZE);
+                let mut retry_count = 0;
+                
+                while let Ok(mut docs) = doc_rx.recv() {
+                    if should_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    
+                    // Efficient batch processing
+                    current_batch.extend(docs.drain(..));
+                    
+                    if current_batch.len() >= COMMIT_BATCH_SIZE {
+                        let mut success = false;
+                        
+                        // Retry loop for resilient writes
+                        while !success && retry_count < MAX_ERROR_RETRIES {
+                            let mut writer_guard = writer.lock().await;
+                            
+                            let batch_result = {
+                                let mut has_error = false;
+                                for doc in current_batch.drain(..) {
+                                    if let Err(e) = writer_guard.add_document(doc) {
+                                        has_error = true;
+                                        error_count.fetch_add(1, Ordering::Relaxed);
+                                        warn!("Failed to add document: {}", e);
+                                        break;
+                                    }
+                                }
+                                if has_error { Err("Failed to add documents".to_string()) } else { Ok(()) }
+                            };
+                            
+                            match batch_result {
+                                Ok(_) => {
+                                    if let Err(e) = writer_guard.commit() {
+                                        warn!("Commit failed (attempt {}): {}", retry_count + 1, e);
+                                        retry_count += 1;
+                                        error_count.fetch_add(1, Ordering::Relaxed);
+                                        tokio::time::sleep(ERROR_RETRY_DELAY).await;
+                                    } else {
+                                        success = true;
+                                        retry_count = 0;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Batch write failed (attempt {}): {}", retry_count + 1, e);
+                                    retry_count += 1;
+                                    error_count.fetch_add(1, Ordering::Relaxed);
+                                    tokio::time::sleep(ERROR_RETRY_DELAY).await;
+                                }
+                            }
+                            
+                            // Release lock before delay
+                            drop(writer_guard);
+                        }
+                        
+                        if !success {
+                            error!("Failed to write batch after {} attempts", MAX_ERROR_RETRIES);
+                            should_stop.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+                
+                // Final cleanup with timeout
+                if !current_batch.is_empty() {
+                    let cleanup_timeout = tokio::time::sleep(CLEANUP_TIMEOUT);
+                    tokio::pin!(cleanup_timeout);
+                    
+                    let cleanup_result = tokio::select! {
+                        _ = async {
+                            let mut writer_guard = writer.lock().await;
+                            for doc in current_batch.drain(..) {
+                                if let Err(e) = writer_guard.add_document(doc) {
+                                    error!("Failed to add document in final batch: {}", e);
+                                }
+                            }
+                            if let Err(e) = writer_guard.commit() {
+                                error!("Failed to commit final batch: {}", e);
+                            }
+                            // Drop the guard to release the lock before waiting
+                            drop(writer_guard);
+                        } => Ok(()),
+                        _ = &mut cleanup_timeout => {
+                            error!("Final cleanup timed out");
+                            Err(())
+                        }
+                    };
+                    
+                    if cleanup_result.is_err() {
+                        should_stop.store(true, Ordering::Release);
                     }
                 }
             }
+        });
+        
+        // Optimized file scanner with CPU throttling
+        let scanner_handle = std::thread::spawn({
+            let tx = tx.clone();
+            let total_count = Arc::clone(&total_count);
+            let phase = Arc::clone(&phase);
+            let should_stop = Arc::clone(&should_stop);
+            
+            move || {
+                let batch = Vec::with_capacity(SCAN_BATCH_SIZE);
+                let files_since_yield = Arc::new(AtomicUsize::new(0));
+                
+                let walker = ignore::WalkBuilder::new(&directory)
+                    .hidden(false)
+                    .ignore(false)
+                    .git_ignore(false)
+                    .threads(MAX_CONCURRENT_SCANNERS)
+                    .build_parallel();
+                
+                walker.run(|| {
+                    let tx = tx.clone();
+                    let total_count = Arc::clone(&total_count);
+                    let should_stop = Arc::clone(&should_stop);
+                    let files_since_yield = Arc::clone(&files_since_yield);
+                    let mut local_batch: Vec<FileInfo> = Vec::with_capacity(PROCESSOR_BATCH_SIZE);
+                    
+                    Box::new(move |entry| {
+                        if should_stop.load(Ordering::Relaxed) {
+                            return ignore::WalkState::Quit;
+                        }
+
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(_) => return ignore::WalkState::Continue,
+                        };
+                        
+                        let path = entry.path().to_owned();
+                        if let Ok(metadata) = fs::metadata(&path) {
+                            if !metadata.is_dir() {
+                                total_count.fetch_add(1, Ordering::Relaxed);
+                                files_since_yield.fetch_add(1, Ordering::Relaxed);
+                                
+                                let file_info = FileInfo {
+                                    path: path.clone(),
+                                    name: path.file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default(),
+                                    size: metadata.len(),
+                                    modified: metadata.modified().ok(),
+                                    created: metadata.created().ok(),
+                                    is_dir: false,
+                                    mime_type: mime_guess::from_path(&path).first().map(|m| m.to_string()),
+                                    content: None,
+                                };
+                                
+                                local_batch.push(file_info);
+                                
+                                // Send batch if full using drain for efficiency
+                                if local_batch.len() >= SCAN_BATCH_SIZE {
+                                    let mut batch: Vec<FileInfo> = Vec::with_capacity(SCAN_BATCH_SIZE);
+                                    batch.extend(local_batch.drain(..));
+                                    
+                                    // Try to send with timeout and backoff
+                                    let mut backoff: u64 = 1;
+                                    while !should_stop.load(Ordering::Relaxed) {
+                                        match tx.try_send(batch) {
+                                            Ok(_) => {
+                                                break;
+                                            }
+                                            Err(crossbeam_channel::TrySendError::Full(returned_batch)) => {
+                                                batch = returned_batch;
+                                                std::thread::sleep(Duration::from_millis(backoff));
+                                                backoff = (backoff * 2).min(100); // Exponential backoff capped at 100ms
+                                            }
+                                            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                                return ignore::WalkState::Quit;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                // Yield to other tasks periodically with adaptive delay
+                                let current_files = files_since_yield.load(Ordering::Relaxed);
+                                if current_files >= SCAN_YIELD_THRESHOLD {
+                                    let yield_duration = if total_count.load(Ordering::Relaxed) > 100_000 {
+                                        Duration::from_millis(5) // Longer yields for large directories
+                                    } else {
+                                        Duration::from_millis(1)
+                                    };
+                                    std::thread::sleep(yield_duration);
+                                    files_since_yield.store(0, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        ignore::WalkState::Continue
+                    })
+                });
+                
+                // Send remaining files
+                if !batch.is_empty() && !should_stop.load(Ordering::Relaxed) {
+                    while !should_stop.load(Ordering::Relaxed) && tx.send(batch.clone()).is_err() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                
+                *phase.write() = String::from("Processing");
+            }
+        });
+        
+        // Spawn optimized document processors
+        let thread_count = num_cpus::get().min(MAX_CONCURRENT_INDEXERS);
+        let doc_processors: Vec<_> = (0..thread_count).map(|_| {
+            let doc_tx = doc_tx.clone();
+            let processed_count = Arc::clone(&processed_count);
+            let rx = rx.clone();
+            let fields = self.fields.clone();
+            
+            std::thread::spawn(move || {
+                let docs_batch: Vec<Document> = Vec::with_capacity(PROCESSOR_BATCH_SIZE);
+                let mut consecutive_errors = 0;
+                let mut total_errors = 0;
+                
+                while let Ok(batch) = rx.recv() {
+                    // Process in smaller chunks for better responsiveness
+                    for chunk in batch.chunks(PROCESSOR_BATCH_SIZE / 4) {
+                        let docs = Self::prepare_document_batch(&fields, chunk);
+                        processed_count.fetch_add(chunk.len(), Ordering::Relaxed);
+                        
+                        // Try to send with backoff on error
+                        let mut backoff = 1;
+                        let mut retry_count = 0;
+                        let mut docs_to_send = docs;
+                        
+                        while retry_count < MAX_ERROR_RETRIES {
+                            match doc_tx.try_send(docs_to_send) {
+                                Ok(_) => {
+                                    consecutive_errors = 0;
+                                    total_errors = 0;
+                                    break;
+                                }
+                                Err(crossbeam_channel::TrySendError::Full(returned_docs)) => {
+                                    docs_to_send = returned_docs;
+                                    std::thread::sleep(Duration::from_millis(backoff));
+                                    backoff = (backoff * 2).min(100);
+                                    retry_count += 1;
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    warn!("Document channel disconnected");
+                                    return;
+                                }
+                            }
+                        }
+                        
+                        // Handle retry failures
+                        if retry_count >= MAX_ERROR_RETRIES {
+                            consecutive_errors += 1;
+                            total_errors += 1;
+                            warn!("Failed to send documents after {} retries", MAX_ERROR_RETRIES);
+                            
+                            // Break if too many errors
+                            if consecutive_errors > 5 || total_errors > 20 {
+                                error!("Too many errors in document processor (consecutive: {}, total: {})", 
+                                    consecutive_errors, total_errors);
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+        }).collect();
+        
+        // Wait for scanner to complete
+        if let Err(e) = scanner_handle.join() {
+            warn!("Scanner thread panicked: {:?}", e);
         }
         
-        // Add file extension
-        if let Some(ext) = file_info.path.extension() {
-            if let Some(ext_str) = ext.to_str() {
-                doc.add_text(self.fields.extension, ext_str.to_lowercase());
+        // Close channels to stop workers
+        drop(tx);
+        
+        // Wait for document processors
+        for handle in doc_processors {
+            if let Err(e) = handle.join() {
+                warn!("Document processor thread panicked: {:?}", e);
             }
         }
         
-        Ok(doc)
+        // Close document channel and wait for writer
+        drop(doc_tx);
+        if let Err(e) = writer_handle.await {
+            warn!("Writer task failed: {:?}", e);
+        }
+        
+        // Stop progress updates
+        progress_handle.abort();
+        
+        let elapsed = start_time.elapsed();
+        let processed = processed_count.load(Ordering::Relaxed);
+        let final_speed = (processed as f64 / elapsed.as_secs_f64()) as u64;
+        
+        info!("Indexing completed in {:.2} seconds. Processed {} files ({:.0} files/sec).", 
+            elapsed.as_secs_f64(),
+            processed,
+            final_speed
+        );
+        
+        // Final progress update
+        progress_callback(&IndexingState {
+            total_files: processed,
+            processed_files: processed,
+            current_file: String::new(),
+            is_complete: true,
+            state: "Complete".to_string(),
+            files_found: processed,
+            start_time: start_time.elapsed().as_secs(),
+            speed: final_speed,
+            phase: "Complete".to_string(),
+        });
+        
+        // Wait for cleanup before marking as complete
+        let writer = self.writer.clone();
+        let cleanup_handle = tokio::spawn(async move {
+            let result = async {
+                let mut writer_guard = writer.lock().await;
+                
+                // Create new writer for replacement
+                let temp_writer = writer_guard.index()
+                    .writer(1024)
+                    .map_err(|e| format!("Failed to create temp writer: {}", e))?;
+                
+                // Replace the writer and take ownership of the old one
+                let mut old_writer = std::mem::replace(&mut *writer_guard, temp_writer);
+                drop(writer_guard); // Release the lock before cleanup
+                
+                // Perform cleanup on the old writer with retries
+                let mut retry_count = 0;
+                
+                while retry_count < MAX_ERROR_RETRIES {
+                    match old_writer.commit() {
+                        Ok(_) => break,
+                        Err(e) => {
+                            warn!("Commit failed during cleanup (attempt {}): {}", retry_count + 1, e);
+                            retry_count += 1;
+                            if retry_count >= MAX_ERROR_RETRIES {
+                                return Err(format!("Failed to commit after {} retries", MAX_ERROR_RETRIES));
+                            }
+                            tokio::time::sleep(ERROR_RETRY_DELAY).await;
+                        }
+                    }
+                }
+                
+                // Wait for merging threads with timeout
+                let merge_timeout = tokio::time::sleep(CLEANUP_TIMEOUT);
+                tokio::pin!(merge_timeout);
+                
+                let merge_result = tokio::select! {
+                    result = tokio::task::spawn_blocking(move || old_writer.wait_merging_threads()) => {
+                        match result {
+                            Ok(Ok(_)) => Ok(()),
+                            Ok(Err(e)) => Err(format!("Merging threads error: {}", e)),
+                            Err(e) => Err(format!("Blocking task error: {}", e))
+                        }
+                    }
+                    _ = merge_timeout => {
+                        warn!("Merging threads timeout after {} seconds", CLEANUP_TIMEOUT.as_secs());
+                        Err("Merging threads timeout".to_string())
+                    }
+                };
+
+                merge_result
+            }.await;
+            
+            if let Err(ref e) = result {
+                error!("Cleanup failed: {}", e);
+            }
+            result
+        });
+
+        // Final cleanup with timeout
+        let cleanup_timeout = tokio::time::sleep(CLEANUP_TIMEOUT);
+        tokio::pin!(cleanup_timeout);
+
+        match tokio::select! {
+            result = cleanup_handle => result.map_err(|e| format!("Cleanup task failed: {}", e))?,
+            _ = cleanup_timeout => {
+                warn!("Final cleanup timed out after {} seconds", CLEANUP_TIMEOUT.as_secs());
+                should_stop.store(true, Ordering::Release);
+                Ok(())
+            }
+        } {
+            Ok(_) => {
+                is_complete.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => {
+                warn!("Final cleanup error: {}", e);
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn get_stats(&self) -> Result<String, String> {
+        let reader = self.index.reader()
+            .map_err(|e| format!("Failed to get index reader: {}", e))?;
+        let searcher = reader.searcher();
+        let num_docs = searcher.num_docs();
+        Ok(format!("Index contains {} documents", num_docs))
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchDoc>, String> {
@@ -369,15 +797,14 @@ impl IndexManager {
                 .to_string();
                 
             let is_dir = mime_type.is_empty();
-            let mime_type_clone = mime_type.clone();
                 
             results.push(SearchDoc {
                 path,
                 name,
                 size,
-                size_formatted: format_size(size),
+                size_formatted: Self::format_size(size),
                 modified_formatted: "Unknown".to_string(), // TODO: Format from timestamp
-                mime_type: mime_type_clone,
+                mime_type,
                 is_dir,
                 matches: None, // TODO: Add context matches
             });
@@ -386,32 +813,41 @@ impl IndexManager {
         Ok(results)
     }
 
-    pub async fn verify_index(&self) -> Result<String, String> {
-        info!("Verifying index...");
-        
-        let reader = self.index
-            .reader()
-            .map_err(|e| format!("Failed to get index reader: {}", e))?;
-            
-        let searcher = reader.searcher();
-        let num_docs = searcher.num_docs();
-        
-        Ok(format!("Index contains {} documents", num_docs))
+    fn format_size(size: u64) -> String {
+        const KB: u64 = 1024;
+        const MB: u64 = KB * 1024;
+        const GB: u64 = MB * 1024;
+        const TB: u64 = GB * 1024;
+
+        if size >= TB {
+            format!("{:.2} TB", size as f64 / TB as f64)
+        } else if size >= GB {
+            format!("{:.2} GB", size as f64 / GB as f64)
+        } else if size >= MB {
+            format!("{:.2} MB", size as f64 / MB as f64)
+        } else if size >= KB {
+            format!("{:.2} KB", size as f64 / KB as f64)
+        } else {
+            format!("{} B", size)
+        }
     }
-}
 
-fn format_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
+    pub async fn add_document(&self, path: PathBuf) -> Result<(), String> {
+        let mut writer = self.writer.lock().await;
+        let file_info = FileInfo::from_path(&path)?;
+        let doc = Self::prepare_document(&self.fields, &file_info);
+        
+        writer.add_document(doc)
+            .map_err(|e| format!("Failed to add document: {}", e))?;
 
-    if size >= GB {
-        format!("{:.2} GB", size as f64 / GB as f64)
-    } else if size >= MB {
-        format!("{:.2} MB", size as f64 / MB as f64)
-    } else if size >= KB {
-        format!("{:.2} KB", size as f64 / KB as f64)
-    } else {
-        format!("{} B", size)
+        // Use a more efficient batching approach with a counter
+        let doc_count = self.indexed_paths.read().len();
+        
+        if doc_count >= COMMIT_BATCH_SIZE {
+            writer.commit()
+                .map_err(|e| format!("Failed to commit: {}", e))?;
+        }
+        
+        Ok(())
     }
 } 

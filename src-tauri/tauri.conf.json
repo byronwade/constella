@@ -1,60 +1,91 @@
 {
-  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/1.5.0/tooling/cli/schema.json",
-  "build": {
-    "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
-    "devPath": "http://localhost:1420",
-    "distDir": "../dist",
-    "withGlobalTauri": false
-  },
-  "package": {
-    "productName": "Constella",
-    "version": "0.1.0"
-  },
-  "tauri": {
-    "allowlist": {
-      "all": false,
-      "shell": {
-        "all": false,
-        "open": true
-      },
-      "dialog": {
-        "all": true
-      },
-      "fs": {
-        "all": true,
-        "scope": ["**"]
-      },
-      "path": {
-        "all": true
-      },
-      "window": {
-        "all": true
-      }
-    },
-    "bundle": {
-      "active": true,
-      "targets": "all",
-      "identifier": "com.constella.dev",
-      "icon": [
-        "icons/32x32.png",
-        "icons/128x128.png",
-        "icons/128x128@2x.png",
-        "icons/icon.icns",
-        "icons/icon.ico"
-      ]
-    },
-    "security": {
-      "csp": null
-    },
-    "windows": [
-      {
-        "fullscreen": false,
-        "resizable": true,
-        "title": "Constella",
-        "width": 800,
-        "height": 600
-      }
-    ]
-  }
+	"$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/1.5.0/tooling/cli/schema.json",
+	"build": {
+		"beforeDevCommand": "npm run dev",
+		"beforeBuildCommand": "npm run build",
+		"devPath": "http://localhost:1420",
+		"distDir": "../dist",
+		"withGlobalTauri": false
+	},
+	"package": {
+		"productName": "Constella File Search",
+		"version": "0.1.0"
+	},
+	"tauri": {
+		"allowlist": {
+			"all": false,
+			"shell": {
+				"all": false,
+				"open": true
+			},
+			"dialog": {
+				"all": true
+			},
+			"fs": {
+				"all": true,
+				"scope": ["**"]
+			},
+			"path": {
+				"all": true
+			},
+			"window": {
+				"all": true
+			}
+		},
+		"bundle": {
+			"active": true,
+			"targets": "all",
+			"identifier": "com.constella.search",
+			"icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+			"resources": [],
+			"externalBin": [],
+			"copyright": "© 2024 Constella",
+			"category": "Utility",
+			"shortDescription": "Fast file search and indexing",
+			"longDescription": "Constella is a powerful file search and indexing tool",
+			"deb": {
+				"depends": []
+			},
+			"macOS": {
+				"frameworks": [],
+				"minimumSystemVersion": "",
+				"exceptionDomain": "",
+				"signingIdentity": null,
+				"entitlements": null
+			},
+			"windows": {
+				"certificateThumbprint": null,
+				"digestAlgorithm": "sha256",
+				"timestampUrl": "",
+				"wix": {
+					"language": "en-US",
+					"fragmentPaths": [],
+					"componentRefs": [],
+					"license": null,
+					"bannerPath": null,
+					"dialogImagePath": null,
+					"template": null
+				},
+				"webviewInstallMode": {
+					"type": "downloadBootstrapper",
+					"silent": true
+				}
+			}
+		},
+		"security": {
+			"csp": null
+		},
+		"windows": [
+			{
+				"title": "Constella",
+				"width": 800,
+				"height": 600,
+				"resizable": true,
+				"fullscreen": false,
+				"decorations": true,
+				"transparent": false,
+				"label": "main"
+			}
+		]
+	}
 } 
