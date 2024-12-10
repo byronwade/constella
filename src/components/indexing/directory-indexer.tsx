@@ -1,67 +1,51 @@
 import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/tauri";
 import { open } from "@tauri-apps/api/dialog";
 import { Button } from "@/components/ui/button";
-import { IndexingProgress } from "./indexing-progress";
-import { IndexingStatus } from "@/lib/types";
-import { Card, CardContent } from "@/components/ui/card";
-import { IndexingService } from "@/lib/services/indexing-service";
+import { Progress } from "@/components/ui/progress";
+import { IndexingProgress } from "@/lib/types";
+import { formatDuration, formatNumber } from "@/lib/utils";
 
 export function DirectoryIndexer() {
 	const [selectedDirectory, setSelectedDirectory] = useState<string | null>(null);
-	const [isLoading, setIsLoading] = useState(false);
-	const [error, setError] = useState<string | null>(null);
-	const [indexingStatus, setIndexingStatus] = useState<IndexingStatus>({
-		total_files: 0,
-		processed_files: 0,
-		files_found: 0,
-		current_file: "",
-		state: "Idle",
-		is_complete: false,
-		start_time: Date.now(),
-	});
+	const [progress, setProgress] = useState<IndexingProgress | null>(null);
+	const [isIndexing, setIsIndexing] = useState(false);
 
-	// Initialize indexing service and progress listener
 	useEffect(() => {
-		const indexingService = IndexingService.getInstance();
-		indexingService
-			.listenToProgress((status) => {
-				console.log("Received indexing status:", status);
-				setIndexingStatus((prev) => ({
-					...prev,
-					...status,
-				}));
+		let interval: NodeJS.Timeout;
 
-				// Update loading state based on status
-				if (status.state === "Complete" || status.state === "Error" || status.state === "Cancelled") {
-					setIsLoading(false);
+		if (isIndexing) {
+			interval = setInterval(async () => {
+				try {
+					const progress = await invoke<IndexingProgress>("get_indexing_progress");
+					setProgress(progress);
+
+					if (progress.state === "completed" || progress.state === "error") {
+						setIsIndexing(false);
+					}
+				} catch (error) {
+					console.error("Failed to get progress:", error);
 				}
-			})
-			.catch((error) => {
-				console.error("Failed to setup progress listener:", error);
-				setError("Failed to setup progress listener");
-			});
+			}, 100);
+		}
 
-		// Cleanup listener on unmount
 		return () => {
-			indexingService.cleanup();
+			if (interval) clearInterval(interval);
 		};
-	}, []);
+	}, [isIndexing]);
 
 	const handleSelectDirectory = async () => {
 		try {
 			const selected = await open({
 				directory: true,
 				multiple: false,
-				defaultPath: "/",
+				defaultPath: "~",
 			});
-
-			if (selected) {
-				setSelectedDirectory(selected as string);
-				setError(null);
+			if (selected && typeof selected === "string") {
+				setSelectedDirectory(selected);
 			}
-		} catch (e) {
-			console.error("Failed to select directory:", e);
-			setError("Failed to select directory");
+		} catch (error) {
+			console.error("Failed to select directory:", error);
 		}
 	};
 
@@ -69,55 +53,51 @@ export function DirectoryIndexer() {
 		if (!selectedDirectory) return;
 
 		try {
-			setIsLoading(true);
-			setError(null);
-			setIndexingStatus((prev) => ({
-				...prev,
-				state: "Scanning",
-				is_complete: false,
-				start_time: Date.now(),
-				total_files: 0,
-				processed_files: 0,
-				files_found: 0,
-			}));
-
-			const indexingService = IndexingService.getInstance();
-			console.log("Starting indexing with service for path:", selectedDirectory);
-			await indexingService.startIndexing(selectedDirectory);
-		} catch (e) {
-			console.error("Failed to start indexing:", e);
-			setError("Failed to start indexing");
-			setIndexingStatus((prev) => ({
-				...prev,
-				state: "Error",
-				is_complete: false,
-			}));
-			setIsLoading(false);
+			setIsIndexing(true);
+			await invoke("start_indexing", { directory: selectedDirectory });
+		} catch (error) {
+			console.error("Failed to start indexing:", error);
+			setIsIndexing(false);
 		}
 	};
 
+	const getProgressPercentage = () => {
+		if (!progress || progress.stats.total_files === 0) return 0;
+		return Math.min(100, (progress.stats.processed_files / progress.stats.total_files) * 100);
+	};
+
 	return (
-		<Card>
-			<CardContent className="pt-6 space-y-4">
-				<div className="flex flex-col gap-4">
-					<div className="flex items-center gap-4">
-						<Button onClick={handleSelectDirectory} disabled={isLoading || indexingStatus.state === "Running" || indexingStatus.state === "Scanning"}>
-							{selectedDirectory ? "Change Directory" : "Select Directory"}
-						</Button>
-						{selectedDirectory && (
-							<Button onClick={handleStartIndexing} disabled={isLoading || indexingStatus.state === "Running" || indexingStatus.state === "Scanning"}>
-								{isLoading ? "Starting..." : "Start Indexing"}
-							</Button>
-						)}
+		<div className="space-y-4">
+			<div className="flex flex-col gap-2">
+				<Button onClick={handleSelectDirectory} disabled={isIndexing}>
+					Select Directory
+				</Button>
+				{selectedDirectory && <div className="text-sm text-muted-foreground truncate">Selected: {selectedDirectory}</div>}
+			</div>
+
+			{progress && (
+				<div className="space-y-4">
+					<div className="flex justify-between items-center">
+						<div className="text-sm font-medium">{progress.state === "completed" ? "Completed" : "Indexing..."}</div>
+						<div className="text-sm text-muted-foreground">{getProgressPercentage().toFixed(1)}%</div>
 					</div>
 
-					{selectedDirectory && <div className="text-sm text-muted-foreground">Selected: {selectedDirectory}</div>}
+					<Progress value={getProgressPercentage()} className="h-2" />
 
-					{error && <div className="text-sm text-red-500">{error}</div>}
-
-					{(indexingStatus.state !== "Idle" || indexingStatus.is_complete) && <IndexingProgress status={indexingStatus} />}
+					<div className="grid grid-cols-2 gap-2 text-sm">
+						<div>
+							Processed: {formatNumber(progress.stats.processed_files)} / {formatNumber(progress.stats.total_files)} files
+						</div>
+						<div>Speed: {formatNumber(Math.round(progress.stats.files_per_second))} files/sec</div>
+						<div>Time: {formatDuration(progress.stats.elapsed_seconds)}</div>
+						{progress.current_file && <div className="col-span-2 truncate text-muted-foreground">{progress.current_file}</div>}
+					</div>
 				</div>
-			</CardContent>
-		</Card>
+			)}
+
+			<Button onClick={handleStartIndexing} disabled={!selectedDirectory || isIndexing} className="w-full">
+				{isIndexing ? "Indexing..." : "Start Indexing"}
+			</Button>
+		</div>
 	);
 }

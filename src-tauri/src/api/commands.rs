@@ -1,87 +1,85 @@
-use tauri::{State, Manager};
-use log::{info, error, debug};
+use tauri::State;
+use crate::indexing::{Indexer, IndexState};
+use log::info;
 use serde::Serialize;
-use crate::indexing::IndexingState;
-use crate::AppState;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct IndexingProgress {
+    pub state: IndexState,
+    pub stats: IndexingStats,
+    pub current_file: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexingStats {
     pub total_files: usize,
     pub processed_files: usize,
-    pub current_file: String,
-    pub state: String,
-    pub is_complete: bool,
-    pub files_found: usize,
-    pub start_time: u64,
+    pub percent_complete: f32,
+    pub files_per_second: f32,
+    pub elapsed_seconds: u64,
+    pub estimated_remaining_seconds: Option<u64>,
 }
 
 #[tauri::command]
-pub async fn select_directory() -> Result<String, String> {
-    let path = tauri::api::dialog::blocking::FileDialogBuilder::new()
-        .set_title("Select Directory to Index")
-        .pick_folder();
-
-    match path {
-        Some(path) => Ok(path.to_string_lossy().to_string()),
-        None => Err("No directory selected".to_string()),
-    }
-}
-
-#[tauri::command]
-pub async fn start_indexing(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    info!("Starting indexing for path: {}", path);
-    let indexer = state.indexer.clone();
-    let app_handle = state.app_handle.clone();
+pub async fn get_indexing_progress(indexer: State<'_, Indexer>) -> Result<IndexingProgress, String> {
+    let state = indexer.get_state();
     
-    debug!("Creating progress callback");
-    // Create progress callback
-    let progress_callback = move |state: &IndexingState| {
-        let progress = IndexingProgress {
+    Ok(IndexingProgress {
+        state: match state.state.as_str() {
+            "idle" => IndexState::Idle,
+            "scanning" => IndexState::Scanning,
+            "indexing" => IndexState::Indexing,
+            "completed" => IndexState::Completed,
+            _ => IndexState::Error("Unknown state".to_string()),
+        },
+        stats: IndexingStats {
             total_files: state.total_files,
             processed_files: state.processed_files,
-            current_file: state.current_file.clone(),
-            state: state.state.clone(),
-            is_complete: state.is_complete,
-            files_found: state.files_found,
-            start_time: state.start_time,
-        };
-        
-        debug!("Emitting progress: {:?}", progress);
-        if let Err(e) = app_handle.emit_all("indexing-progress", progress) {
-            error!("Failed to emit progress: {}", e);
-        }
-    };
-
-    debug!("Spawning indexing task");
-    // Start indexing in the background
-    tokio::spawn(async move {
-        debug!("Acquiring index manager lock");
-        let index_manager = indexer.lock().await;
-        debug!("Starting indexing operation");
-        if let Err(e) = index_manager.start_indexing(path, progress_callback).await {
-            error!("Indexing failed: {}", e);
-        }
-    });
-
-    debug!("Indexing task spawned");
-    Ok(())
+            percent_complete: if state.total_files > 0 {
+                (state.processed_files as f32 / state.total_files as f32) * 100.0
+            } else {
+                0.0
+            },
+            files_per_second: state.files_per_second,
+            elapsed_seconds: state.elapsed_seconds,
+            estimated_remaining_seconds: if state.files_per_second > 0.0 {
+                let remaining_files = state.total_files.saturating_sub(state.processed_files);
+                Some((remaining_files as f32 / state.files_per_second) as u64)
+            } else {
+                None
+            },
+        },
+        current_file: state.current_file,
+    })
 }
 
 #[tauri::command]
-pub async fn search_files(
-    query: String,
-    state: State<'_, AppState>,
-) -> Result<Vec<serde_json::Value>, String> {
-    info!("search_files: Executing search query: {}", query);
-    let index_manager = state.indexer.lock().await;
-    let results = index_manager.search(&query).await?;
-    Ok(results)
+pub async fn start_indexing(directory: String, indexer: State<'_, Indexer>) -> Result<(), String> {
+    info!("Starting indexing for directory: {}", directory);
+    indexer.start_indexing(&directory).await
 }
 
 #[tauri::command]
-pub async fn verify_index(
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let index_manager = state.indexer.lock().await;
-    index_manager.get_stats().await
+pub async fn search_files(query: String, indexer: State<'_, Indexer>) -> Result<Vec<serde_json::Value>, String> {
+    info!("Searching for: {}", query);
+    indexer.search(&query).await
+}
+
+#[tauri::command]
+pub async fn cancel_indexing(indexer: State<'_, Indexer>) -> Result<(), String> {
+    info!("Cancelling indexing");
+    indexer.cancel().await
+}
+
+#[tauri::command]
+pub async fn get_index_stats(indexer: State<'_, Indexer>) -> Result<serde_json::Value, String> {
+    let reader = indexer.get_reader().await
+        .map_err(|e| format!("Failed to get reader: {}", e))?;
+    let searcher = reader.searcher();
+    
+    let mut stats = serde_json::Map::new();
+    stats.insert("total_documents".to_string(), serde_json::Value::Number(serde_json::Number::from(searcher.num_docs())));
+    stats.insert("last_updated".to_string(), serde_json::Value::String(chrono::Local::now().to_rfc3339()));
+    
+    Ok(serde_json::Value::Object(stats))
 } 

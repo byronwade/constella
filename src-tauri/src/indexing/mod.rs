@@ -1,414 +1,370 @@
 use std::sync::Arc;
 use std::fs;
-use std::path::Path;
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
-use log::{info, error, debug};
+use log::{info, error, warn};
 use tantivy::{Index, IndexWriter, schema::*, Document};
-use tantivy::directory::MmapDirectory;
 use tantivy::query::QueryParser;
 use tantivy::collector::TopDocs;
-use std::time::UNIX_EPOCH;
+use std::time::{UNIX_EPOCH, SystemTime};
+use serde_json;
+use serde::Serialize;
 
-const INDEX_BUFFER_SIZE: usize = 50_000_000; // 50MB
-const COMMIT_INTERVAL: usize = 1000; // Commit every 1000 documents
+const INDEX_BUFFER_SIZE: usize = 100_000_000; // 100MB buffer for better performance
+const COMMIT_BATCH_SIZE: usize = 10_000; // Larger batches for better throughput
+const MAX_RETRY_ATTEMPTS: usize = 3;
+const CHANNEL_BUFFER_SIZE: usize = 100_000; // Large channel buffer for better throughput
 
-// System directories and files to skip
-const SKIP_PATHS: &[&str] = &[
-    "/usr",
-    "/System",
-    "/Library",
-    "/private",
-    "/dev",
-    "/bin",
-    "/sbin",
-    "/opt",
-    "/var",
-    "/etc",
-    "/.VolumeIcon.icns", // Skip volume icon explicitly
-    "/.Spotlight-V100",  // Skip Spotlight index
-    "/.fseventsd",       // Skip FSEvents
-];
-
-fn should_skip_path(path: &Path) -> bool {
-    // Skip hidden files and directories
-    if path.file_name()
-        .and_then(|s| s.to_str())
-        .map(|s| s.starts_with('.'))
-        .unwrap_or(false) {
-        return true;
-    }
-
-    // Skip system directories and special files
-    if let Some(path_str) = path.to_str() {
-        if SKIP_PATHS.iter().any(|skip| path_str.starts_with(skip)) {
-            debug!("Skipping system path: {}", path_str);
-            return true;
-        }
-    }
-
-    false
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexState {
+    Idle,
+    Scanning,
+    Indexing,
+    Completed,
+    Error(String),
 }
 
-#[derive(Debug)]
-pub struct SchemaFields {
-    pub path: Field,
-    pub content: Field,
-    pub file_name: Field,
-    pub file_type: Field,
-    pub modified: Field,
-    pub size: Field,
-}
-
-pub struct IndexingState {
+#[derive(Debug, Clone)]
+pub struct IndexerState {
     pub total_files: usize,
     pub processed_files: usize,
     pub current_file: String,
     pub state: String,
-    pub is_complete: bool,
-    pub files_found: usize,
-    pub start_time: u64,
+    pub files_per_second: f32,
+    pub elapsed_seconds: u64,
+    pub start_time: SystemTime,
 }
 
-impl Default for IndexingState {
-    fn default() -> Self {
-        Self {
-            total_files: 0,
-            processed_files: 0,
-            current_file: String::new(),
-            state: "Idle".to_string(),
-            is_complete: false,
-            files_found: 0,
-            start_time: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        }
-    }
-}
-
-pub struct IndexManager {
-    fields: SchemaFields,
+pub struct Indexer {
     index: Index,
-    writer: Arc<Mutex<IndexWriter>>,
-    state: Arc<RwLock<IndexingState>>,
+    writer: Arc<Mutex<Option<IndexWriter>>>,
+    state: Arc<RwLock<IndexerState>>,
+    path_field: Field,
+    modified_field: Field,
+    size_field: Field,
 }
 
-impl IndexManager {
+impl Indexer {
     pub fn new() -> Result<Self, String> {
-        info!("Creating new IndexManager");
+        info!("Creating new Indexer instance");
         let mut schema_builder = Schema::builder();
 
-        // Define schema fields
-        let path = schema_builder.add_text_field("path", TEXT | STORED);
-        let content = schema_builder.add_text_field("content", TEXT);
-        let file_name = schema_builder.add_text_field("file_name", TEXT | STORED);
-        let file_type = schema_builder.add_text_field("file_type", TEXT | STORED);
-        let modified = schema_builder.add_text_field("modified", TEXT | STORED);
-        let size = schema_builder.add_text_field("size", TEXT | STORED);
+        let path_field = schema_builder.add_text_field("path", TEXT | STORED);
+        let modified_field = schema_builder.add_u64_field("modified", STORED | FAST);
+        let size_field = schema_builder.add_u64_field("size", STORED | FAST);
 
         let schema = schema_builder.build();
-        let fields = SchemaFields {
-            path,
-            content,
-            file_name,
-            file_type,
-            modified,
-            size,
+        info!("Schema built with fields: path, modified, size");
+
+        let app_data_dir = tauri::api::path::app_data_dir(&tauri::Config::default())
+            .ok_or_else(|| "Failed to get app data directory".to_string())?;
+        let index_path = app_data_dir.join("search_index");
+        
+        std::fs::create_dir_all(&index_path)
+            .map_err(|e| format!("Failed to create index directory: {}", e))?;
+
+        let index = if index_path.exists() {
+            info!("Opening existing index at {:?}", index_path);
+            Index::open_in_dir(&index_path)
+                .map_err(|e| format!("Failed to open existing index: {}", e))?
+        } else {
+            info!("Creating new index at {:?}", index_path);
+            Index::create_in_dir(&index_path, schema)
+                .map_err(|e| format!("Failed to create index: {}", e))?
         };
-
-        info!("Schema built successfully");
-
-        // Try to create or open the index directory
-        let index_path = "index";
-        if let Err(e) = fs::create_dir_all(index_path) {
-            return Err(format!("Failed to create index directory: {}", e));
-        }
-
-        info!("Index directory created/verified");
-
-        // Create or open the index
-        let index = match MmapDirectory::open(index_path) {
-            Ok(dir) => {
-                match Index::open(dir) {
-                    Ok(existing_index) => {
-                        if existing_index.schema() != schema {
-                            info!("Schema mismatch detected, recreating index");
-                            // Remove old index
-                            if let Err(e) = fs::remove_dir_all(index_path) {
-                                return Err(format!("Failed to remove old index: {}", e));
-                            }
-                            if let Err(e) = fs::create_dir_all(index_path) {
-                                return Err(format!("Failed to recreate index directory: {}", e));
-                            }
-                            // Create new index
-                            Index::create_in_dir(index_path, schema)
-                                .map_err(|e| format!("Failed to create new index: {}", e))?
-                        } else {
-                            info!("Using existing index with matching schema");
-                            existing_index
-                        }
-                    },
-                    Err(_) => {
-                        info!("Creating new index");
-                        Index::create_in_dir(index_path, schema)
-                            .map_err(|e| format!("Failed to create new index: {}", e))?
-                    }
-                }
-            },
-            Err(e) => return Err(format!("Failed to open index directory: {}", e))
-        };
-
-        info!("Index opened/created successfully");
-
-        // Create index writer
-        let writer = index.writer(INDEX_BUFFER_SIZE)
-            .map_err(|e| format!("Failed to create index writer: {}", e))?;
-
-        info!("Index writer created successfully");
 
         Ok(Self {
-            fields,
             index,
-            writer: Arc::new(Mutex::new(writer)),
-            state: Arc::new(RwLock::new(IndexingState::default())),
+            writer: Arc::new(Mutex::new(None)),
+            state: Arc::new(RwLock::new(IndexerState {
+                total_files: 0,
+                processed_files: 0,
+                current_file: String::new(),
+                state: "idle".to_string(),
+                files_per_second: 0.0,
+                elapsed_seconds: 0,
+                start_time: SystemTime::now(),
+            })),
+            path_field,
+            modified_field,
+            size_field,
         })
     }
 
-    pub async fn start_indexing(&self, directory: String, progress_callback: impl Fn(&IndexingState) + Send + 'static) -> Result<(), String> {
-        info!("Starting indexing for directory: {}", directory);
-        let start_time = std::time::Instant::now();
+    pub fn get_state(&self) -> IndexerState {
+        let mut state = self.state.write();
+        let elapsed = state.start_time.elapsed().unwrap_or_default();
+        let elapsed_secs = elapsed.as_secs();
         
-        // Update initial state
-        {
-            let mut state = self.state.write();
+        // Calculate files per second
+        if elapsed_secs > 0 {
+            state.files_per_second = state.processed_files as f32 / elapsed_secs as f32;
+        } else {
+            state.files_per_second = 0.0;
+        }
+        
+        state.elapsed_seconds = elapsed_secs;
+        state.clone()
+    }
+
+    pub async fn get_reader(&self) -> tantivy::Result<tantivy::IndexReader> {
+        self.index.reader()
+    }
+
+    pub async fn update_state<F>(&self, update_fn: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut IndexerState),
+    {
+        let mut state = self.state.write();
+        update_fn(&mut state);
+
+        // Ensure processed files never exceeds total files
+        if state.processed_files > state.total_files {
+            state.processed_files = state.total_files;
+        }
+
+        // Update files per second
+        let elapsed = state.start_time.elapsed().unwrap_or_default();
+        let elapsed_secs = elapsed.as_secs();
+        if elapsed_secs > 0 {
+            state.files_per_second = state.processed_files as f32 / elapsed_secs as f32;
+        }
+
+        state.elapsed_seconds = elapsed_secs;
+        Ok(())
+    }
+
+    pub async fn start_indexing(&self, path: impl AsRef<str>) -> Result<(), String> {
+        let path = path.as_ref().to_string();
+        info!("=== STARTING INDEXING PROCESS ===");
+        info!("Target directory: {}", path);
+        
+        // Reset state and start scanning phase
+        self.update_state(|state| {
             state.total_files = 0;
             state.processed_files = 0;
-            state.current_file = format!("Starting scan of {}", directory);
-            state.is_complete = false;
-            state.state = "Scanning".to_string();
-            state.files_found = 0;
-            progress_callback(&state);
+            state.current_file = format!("Scanning {}", path);
+            state.state = "scanning".to_string();
+            state.start_time = SystemTime::now();
+        }).await?;
+
+        // Clear existing index
+        info!("Clearing existing index");
+        let mut writer_guard = self.writer.lock().await;
+        *writer_guard = Some(self.index.writer_with_num_threads(4, INDEX_BUFFER_SIZE)
+            .map_err(|e| format!("Failed to create writer: {}", e))?);
+        
+        if let Some(writer) = writer_guard.as_mut() {
+            writer.delete_all_documents()
+                .map_err(|e| format!("Failed to clear index: {}", e))?;
+            writer.commit()
+                .map_err(|e| format!("Failed to commit index clearing: {}", e))?;
+        }
+        drop(writer_guard);
+
+        // PHASE 1: Scanning
+        info!("=== PHASE 1: SCANNING ===");
+        info!("Starting scan of directory: {}", path);
+        let scanner = crate::scanner::FileScanner::new();
+        let total_files = scanner.scan_directory(&path).await;
+        info!("Initial scan completed, found {} files", total_files);
+        
+        if total_files == 0 {
+            error!("No files found in directory: {}", path);
+            self.update_state(|state| {
+                state.state = "completed".to_string();
+                state.current_file = "No files found".to_string();
+            }).await?;
+            return Ok(());
         }
 
-        // Create a channel for file paths
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1000);
-        let tx_clone = tx.clone();
+        // PHASE 2: Initialize indexing
+        info!("=== PHASE 2: INDEXING ===");
+        info!("Preparing to index {} files", total_files);
+        self.update_state(|state| {
+            state.total_files = total_files;
+            state.processed_files = 0;
+            state.state = "indexing".to_string();
+            state.start_time = SystemTime::now(); // Reset timer for indexing phase
+            state.current_file = "Starting indexing...".to_string();
+        }).await?;
 
-        // Spawn file system walker
-        let walker_handle = tokio::spawn(async move {
-            let walker = walkdir::WalkDir::new(&directory)
-                .follow_links(true)
-                .into_iter()
-                .filter_entry(|e| !should_skip_path(e.path()));
+        // Initialize writer for indexing
+        let mut writer_guard = self.writer.lock().await;
+        *writer_guard = Some(self.index.writer_with_num_threads(4, INDEX_BUFFER_SIZE)
+            .map_err(|e| format!("Failed to create writer: {}", e))?);
+        drop(writer_guard);
 
-            for entry in walker {
-                match entry {
-                    Ok(entry) => {
-                        if entry.file_type().is_file() {
-                            // Skip files we don't have permission to read
-                            if let Ok(metadata) = entry.metadata() {
-                                if metadata.permissions().readonly() {
-                                    debug!("Skipping readonly file: {}", entry.path().display());
-                                    continue;
-                                }
-                            }
-
-                            if let Err(e) = tx_clone.send(entry.path().to_path_buf()).await {
-                                error!("Failed to send path: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // Log but don't fail on common errors
-                        match e.io_error().map(|e| e.kind()) {
-                            Some(std::io::ErrorKind::PermissionDenied) => {
-                                debug!("Permission denied: {}", e);
-                            }
-                            Some(std::io::ErrorKind::NotFound) => {
-                                debug!("File not found (may have been deleted): {}", e);
-                            }
-                            _ => {
-                                error!("Walker error: {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Process files
-        let mut writer = self.writer.lock().await;
+        // PHASE 3: Process files
+        info!("=== PHASE 3: COLLECTING PATHS ===");
+        let mut batch = Vec::with_capacity(COMMIT_BATCH_SIZE);
         let mut processed = 0;
-        let mut total = 0;
 
-        while let Some(path) = rx.recv().await {
-            total += 1;
-            {
-                let mut state = self.state.write();
-                state.total_files = total;
-                state.files_found = total;
-                progress_callback(&state);
-            }
+        // Get all paths to process
+        let paths = scanner.collect_paths(&path);
+        let total = paths.len();
+        info!("Collected {} paths to index", total);
 
+        if total != total_files {
+            warn!("Path count mismatch: scan found {}, but collected {}", total_files, total);
+        }
+
+        // Process each file
+        info!("=== PHASE 4: INDEXING FILES ===");
+        for path in paths {
             let path_str = path.to_string_lossy().into_owned();
-            debug!("Processing file: {}", path_str);
-
-            // Skip if path should be ignored
-            if should_skip_path(&path) {
-                debug!("Skipping excluded path: {}", path_str);
-                continue;
-            }
-
-            // Read file metadata
-            let metadata = match fs::metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    debug!("Failed to read metadata for {}: {}", path_str, e);
-                    continue;
-                }
-            };
-
-            // Skip large files (e.g., > 10MB)
-            if metadata.len() > 10_000_000 {
-                debug!("Skipping large file: {} ({} bytes)", path_str, metadata.len());
-                continue;
-            }
-
-            // Read file content
-            let content = match fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(e) => {
-                    debug!("Skipping binary or unreadable file {}: {}", path_str, e);
-                    continue;
-                }
-            };
-
-            // Create document
-            let mut doc = Document::new();
-            doc.add_text(self.fields.path, &path_str);
-            doc.add_text(self.fields.content, &content);
-            doc.add_text(self.fields.file_name, path.file_name().unwrap_or_default().to_string_lossy().as_ref());
-            doc.add_text(self.fields.file_type, path.extension().unwrap_or_default().to_string_lossy().as_ref());
+            info!("Processing file: {}", path_str);
             
-            // Handle modified time with a fallback to 0 if we can't get the modification time
-            let modified_time = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_secs().to_string())
-                .unwrap_or_else(|| "0".to_string());
-            doc.add_text(self.fields.modified, &modified_time);
-            
-            doc.add_text(self.fields.size, metadata.len().to_string());
+            // Create and add document
+            match self.create_document(&path) {
+                Ok(doc) => {
+                    batch.push(doc);
+                    processed += 1;
 
-            // Add document to index
-            if let Err(e) = writer.add_document(doc) {
-                error!("Failed to add document for {}: {}", path_str, e);
-                continue;
-            }
+                    // Update state
+                    self.update_state(move |state| {
+                        state.processed_files = processed;
+                        state.current_file = path_str.clone();
+                    }).await?;
 
-            processed += 1;
-            {
-                let mut state = self.state.write();
-                state.processed_files = processed;
-                state.current_file = path_str;
-                progress_callback(&state);
-            }
-
-            // Commit periodically
-            if processed % COMMIT_INTERVAL == 0 {
-                if let Err(e) = writer.commit() {
-                    error!("Failed to commit batch: {}", e);
+                    // Commit batch if needed
+                    if batch.len() >= COMMIT_BATCH_SIZE {
+                        info!("Committing batch of {} documents", batch.len());
+                        if let Err(e) = self.commit_batch(&mut batch).await {
+                            error!("Failed to commit batch: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to create document for {}: {}", path_str, e);
                 }
             }
         }
 
-        // Wait for walker to complete
-        if let Err(e) = walker_handle.await {
-            error!("Walker task failed: {}", e);
+        // Commit any remaining documents
+        if !batch.is_empty() {
+            info!("Committing final batch of {} documents", batch.len());
+            if let Err(e) = self.commit_batch(&mut batch).await {
+                error!("Failed to commit final batch: {}", e);
+            }
         }
 
-        // Final commit
-        if let Err(e) = writer.commit() {
-            error!("Failed to commit final batch: {}", e);
-        }
+        // Final state update
+        self.update_state(|state| {
+            state.state = "completed".to_string();
+            state.processed_files = processed;
+            state.current_file = "Indexing completed".to_string();
+        }).await?;
 
-        let elapsed = start_time.elapsed();
-        info!("Indexing completed in {:?}", elapsed);
-        
-        // Update final state
-        {
-            let mut state = self.state.write();
-            state.state = "Complete".to_string();
-            state.is_complete = true;
-            progress_callback(&state);
+        info!("=== INDEXING COMPLETED ===");
+        info!("Total files processed: {}/{}", processed, total);
+        Ok(())
+    }
+
+    async fn commit_batch(&self, batch: &mut Vec<Document>) -> Result<(), String> {
+        let mut writer_guard = self.writer.lock().await;
+        if let Some(writer) = writer_guard.as_mut() {
+            for doc in batch.drain(..) {
+                if let Err(e) = writer.add_document(doc) {
+                    error!("Failed to add document: {}", e);
+                }
+            }
+            writer.commit()
+                .map_err(|e| format!("Failed to commit batch: {}", e))?;
         }
+        Ok(())
+    }
+
+    fn create_document(&self, path: impl AsRef<std::path::Path>) -> Result<Document, String> {
+        let path = path.as_ref();
+        let mut doc = Document::default();
         
+        // Get file metadata
+        let metadata = fs::metadata(path)
+            .map_err(|e| format!("Failed to get metadata for {}: {}", path.display(), e))?;
+        
+        // Add path
+        doc.add_text(self.path_field, path.to_string_lossy().as_ref());
+        
+        // Add modified time
+        let modified = metadata.modified()
+            .map_err(|e| format!("Failed to get modified time: {}", e))?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("Failed to calculate duration: {}", e))?
+            .as_secs();
+        doc.add_u64(self.modified_field, modified);
+        
+        // Add file size
+        doc.add_u64(self.size_field, metadata.len());
+        
+        Ok(doc)
+    }
+
+    async fn recreate_writer(&self) -> Result<(), String> {
+        let mut writer_guard = self.writer.lock().await;
+        *writer_guard = Some(self.index.writer(INDEX_BUFFER_SIZE)
+            .map_err(|e| format!("Failed to recreate writer: {}", e))?);
         Ok(())
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<serde_json::Value>, String> {
-        let reader = self.index.reader()
-            .map_err(|e| format!("Failed to get index reader: {}", e))?;
+        let reader = self.get_reader().await
+            .map_err(|e| format!("Failed to get reader: {}", e))?;
+        
         let searcher = reader.searcher();
-
-        // Create a query parser that searches in name, path, and content fields
-        let mut query_parser = QueryParser::for_index(&self.index, vec![
-            self.fields.file_name,
-            self.fields.path,
-            self.fields.content,
-            self.fields.file_type
-        ]);
-
-        // Set field boosts
-        query_parser.set_field_boost(self.fields.file_name, 3.0);
-        query_parser.set_field_boost(self.fields.path, 2.0);
-        query_parser.set_field_boost(self.fields.content, 1.0);
-
-        // Parse and execute query
+        let query_parser = QueryParser::for_index(&self.index, vec![self.path_field]);
+        
         let query = query_parser.parse_query(query)
             .map_err(|e| format!("Failed to parse query: {}", e))?;
+        
         let top_docs = searcher.search(&query, &TopDocs::with_limit(100))
-            .map_err(|e| format!("Search failed: {}", e))?;
-
-        let mut results = Vec::new();
-        for (_score, doc_address) in top_docs {
+            .map_err(|e| format!("Failed to execute search: {}", e))?;
+        
+        let mut results = Vec::with_capacity(top_docs.len());
+        for (score, doc_address) in top_docs {
             let retrieved_doc = searcher.doc(doc_address)
                 .map_err(|e| format!("Failed to retrieve document: {}", e))?;
-            let mut doc_json = serde_json::Map::new();
-
-            // Get values from document
-            if let Some(name) = retrieved_doc
-                .get_first(self.fields.file_name)
-                .and_then(|f| f.as_text()) {
-                doc_json.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+            
+            let path = retrieved_doc.get_first(self.path_field)
+                .and_then(|f| f.as_text())
+                .ok_or_else(|| "Document missing path field".to_string())?;
+            
+            let modified = retrieved_doc.get_first(self.modified_field)
+                .and_then(|f| f.as_u64())
+                .unwrap_or_default();
+            
+            let size = retrieved_doc.get_first(self.size_field)
+                .and_then(|f| f.as_u64())
+                .unwrap_or_default();
+            
+            let path_buf = std::path::PathBuf::from(path);
+            let name = path_buf.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            
+            let mut doc = serde_json::Map::new();
+            doc.insert("path".to_string(), serde_json::Value::String(path.to_string()));
+            doc.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+            doc.insert("size".to_string(), serde_json::Value::Number(serde_json::Number::from(size)));
+            doc.insert("modified".to_string(), serde_json::Value::Number(serde_json::Number::from(modified)));
+            
+            // Convert score to f64 and handle the Option with a default value
+            if let Some(score_num) = serde_json::Number::from_f64(score as f64) {
+                doc.insert("score".to_string(), serde_json::Value::Number(score_num));
+            } else {
+                doc.insert("score".to_string(), serde_json::Value::Number(serde_json::Number::from(0)));
             }
-
-            if let Some(path) = retrieved_doc
-                .get_first(self.fields.path)
-                .and_then(|f| f.as_text()) {
-                doc_json.insert("path".to_string(), serde_json::Value::String(path.to_string()));
-            }
-
-            if let Some(file_type) = retrieved_doc
-                .get_first(self.fields.file_type)
-                .and_then(|f| f.as_text()) {
-                doc_json.insert("type".to_string(), serde_json::Value::String(file_type.to_string()));
-            }
-
-            results.push(serde_json::Value::Object(doc_json));
+            
+            results.push(serde_json::Value::Object(doc));
         }
-
+        
         Ok(results)
     }
 
-    pub async fn get_stats(&self) -> Result<String, String> {
-        let state = self.state.read();
-        Ok(format!(
-            "Total files: {}, Processed: {}, Complete: {}",
-            state.total_files, state.processed_files, state.is_complete
-        ))
+    pub async fn cancel(&self) -> Result<(), String> {
+        self.update_state(|state| {
+            state.state = "completed".to_string();
+        }).await
     }
 } 

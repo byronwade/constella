@@ -19,70 +19,25 @@
       }
     },
     {
-      "name": "content",
-      "type": "text",
-      "options": {
-        "indexing": {
-          "record": "position",
-          "fieldnorms": true,
-          "tokenizer": "default"
-        },
-        "stored": false,
-        "fast": false
-      }
-    },
-    {
-      "name": "file_name",
-      "type": "text",
-      "options": {
-        "indexing": {
-          "record": "position",
-          "fieldnorms": true,
-          "tokenizer": "default"
-        },
-        "stored": true,
-        "fast": false
-      }
-    },
-    {
-      "name": "file_type",
-      "type": "text",
-      "options": {
-        "indexing": {
-          "record": "position",
-          "fieldnorms": true,
-          "tokenizer": "default"
-        },
-        "stored": true,
-        "fast": false
-      }
-    },
-    {
       "name": "modified",
-      "type": "text",
+      "type": "u64",
       "options": {
-        "indexing": {
-          "record": "position",
-          "fieldnorms": true,
-          "tokenizer": "default"
-        },
-        "stored": true,
-        "fast": false
+        "indexed": false,
+        "fieldnorms": false,
+        "fast": false,
+        "stored": true
       }
     },
     {
       "name": "size",
-      "type": "text",
+      "type": "u64",
       "options": {
-        "indexing": {
-          "record": "position",
-          "fieldnorms": true,
-          "tokenizer": "default"
-        },
-        "stored": true,
-        "fast": false
+        "indexed": false,
+        "fieldnorms": false,
+        "fast": false,
+        "stored": true
       }
     }
   ],
-  "opstamp": 0
+  "opstamp": 30015
 }
