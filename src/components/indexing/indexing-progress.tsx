@@ -11,6 +11,8 @@ export function IndexingProgress({ status }: IndexingProgressProps) {
 	const formattedTotal = status.total_files.toLocaleString();
 	const formattedProcessed = status.processed_files.toLocaleString();
 	const formattedFound = status.files_found?.toLocaleString() || "0";
+	const elapsedTime = Date.now() - status.start_time;
+	const speed = elapsedTime > 0 ? Math.round(status.processed_files / (elapsedTime / 1000)) : 0;
 
 	return (
 		<div className="space-y-2">
@@ -32,7 +34,7 @@ export function IndexingProgress({ status }: IndexingProgressProps) {
 
 			<Progress value={progress} className="h-2" />
 
-			{status.state === "Running" && status.current_file && (
+			{(status.state === "Running" || status.state === "Scanning") && status.current_file && (
 				<div className="text-sm text-muted-foreground truncate">
 					<div className="font-medium">Current file:</div>
 					<div className="truncate">{status.current_file}</div>
@@ -47,7 +49,7 @@ export function IndexingProgress({ status }: IndexingProgressProps) {
 						<div>
 							Processed: {formattedProcessed} / {formattedTotal} files
 						</div>
-						<div className="text-xs">{status.processed_files > 0 && <>Speed: {Math.round(status.processed_files / ((Date.now() - status.start_time) / 1000))} files/sec</>}</div>
+						{status.processed_files > 0 && <div className="text-xs">Speed: {speed} files/sec</div>}
 					</div>
 				)}
 			</div>

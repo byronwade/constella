@@ -34,35 +34,13 @@ fn create_context_menu() -> Menu {
     Menu::new().add_submenu(debug_menu)
 }
 
-#[tokio::main]
-async fn main() {
-    // Initialize logging with debug level and detailed format
-    env_logger::Builder::from_default_env()
-        .format(|buf, record| {
-            use std::io::Write;
-            writeln!(buf,
-                "[{} {} {} {}:{}] {}",
-                chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-                record.level(),
-                record.target(),
-                record.file().unwrap_or("unknown"),
-                record.line().unwrap_or(0),
-                record.args()
-            )
-        })
-        .filter_level(LevelFilter::Debug)
-        .filter_module("constella", LevelFilter::Debug)
-        .filter_module("tantivy", LevelFilter::Info)
-        .filter_module("ignore", LevelFilter::Info)
-        .init();
-
+fn main() {
+    env_logger::init();
     debug!("Starting Constella application with debug logging enabled");
-    
-    // Create index manager first
-    let index_manager = IndexManager::new()
-        .await
-        .expect("Failed to create index manager");
 
+    // Initialize the index manager
+    let index_manager = IndexManager::new()
+        .expect("Failed to create index manager");
     debug!("Index manager created successfully");
 
     info!("Initializing Tauri builder");

@@ -1,11 +1,10 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/tauri";
 import { open } from "@tauri-apps/api/dialog";
 import { Button } from "@/components/ui/button";
 import { IndexingProgress } from "./indexing-progress";
 import { IndexingStatus } from "@/lib/types";
-import { listen } from "@tauri-apps/api/event";
 import { Card, CardContent } from "@/components/ui/card";
+import { IndexingService } from "@/lib/services/indexing-service";
 
 export function DirectoryIndexer() {
 	const [selectedDirectory, setSelectedDirectory] = useState<string | null>(null);
@@ -16,23 +15,35 @@ export function DirectoryIndexer() {
 		processed_files: 0,
 		files_found: 0,
 		current_file: "",
-		state: "Idle" as const,
+		state: "Idle",
 		is_complete: false,
 		start_time: Date.now(),
 	});
 
-	// Listen for indexing progress events
+	// Initialize indexing service and progress listener
 	useEffect(() => {
-		const unlisten = listen<IndexingStatus>("indexing-progress", (event) => {
-			setIndexingStatus((prev) => ({
-				...prev,
-				...event.payload,
-				start_time: prev.start_time, // Preserve the original start time
-			}));
-		});
+		const indexingService = IndexingService.getInstance();
+		indexingService
+			.listenToProgress((status) => {
+				console.log("Received indexing status:", status);
+				setIndexingStatus((prev) => ({
+					...prev,
+					...status,
+				}));
 
+				// Update loading state based on status
+				if (status.state === "Complete" || status.state === "Error" || status.state === "Cancelled") {
+					setIsLoading(false);
+				}
+			})
+			.catch((error) => {
+				console.error("Failed to setup progress listener:", error);
+				setError("Failed to setup progress listener");
+			});
+
+		// Cleanup listener on unmount
 		return () => {
-			unlisten.then((fn) => fn());
+			indexingService.cleanup();
 		};
 	}, []);
 
@@ -62,7 +73,7 @@ export function DirectoryIndexer() {
 			setError(null);
 			setIndexingStatus((prev) => ({
 				...prev,
-				state: "Scanning" as const,
+				state: "Scanning",
 				is_complete: false,
 				start_time: Date.now(),
 				total_files: 0,
@@ -70,16 +81,17 @@ export function DirectoryIndexer() {
 				files_found: 0,
 			}));
 
-			await invoke("start_indexing", { path: selectedDirectory });
+			const indexingService = IndexingService.getInstance();
+			console.log("Starting indexing with service for path:", selectedDirectory);
+			await indexingService.startIndexing(selectedDirectory);
 		} catch (e) {
 			console.error("Failed to start indexing:", e);
 			setError("Failed to start indexing");
 			setIndexingStatus((prev) => ({
 				...prev,
-				state: "Error" as const,
+				state: "Error",
 				is_complete: false,
 			}));
-		} finally {
 			setIsLoading(false);
 		}
 	};
@@ -89,11 +101,11 @@ export function DirectoryIndexer() {
 			<CardContent className="pt-6 space-y-4">
 				<div className="flex flex-col gap-4">
 					<div className="flex items-center gap-4">
-						<Button onClick={handleSelectDirectory} disabled={isLoading}>
+						<Button onClick={handleSelectDirectory} disabled={isLoading || indexingStatus.state === "Running" || indexingStatus.state === "Scanning"}>
 							{selectedDirectory ? "Change Directory" : "Select Directory"}
 						</Button>
 						{selectedDirectory && (
-							<Button onClick={handleStartIndexing} disabled={isLoading}>
+							<Button onClick={handleStartIndexing} disabled={isLoading || indexingStatus.state === "Running" || indexingStatus.state === "Scanning"}>
 								{isLoading ? "Starting..." : "Start Indexing"}
 							</Button>
 						)}

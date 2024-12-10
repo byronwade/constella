@@ -15,11 +15,11 @@
           "tokenizer": "default"
         },
         "stored": true,
-        "fast": true
+        "fast": false
       }
     },
     {
-      "name": "name",
+      "name": "content",
       "type": "text",
       "options": {
         "indexing": {
@@ -27,12 +27,12 @@
           "fieldnorms": true,
           "tokenizer": "default"
         },
-        "stored": true,
-        "fast": true
+        "stored": false,
+        "fast": false
       }
     },
     {
-      "name": "content",
+      "name": "file_name",
       "type": "text",
       "options": {
         "indexing": {
@@ -54,56 +54,24 @@
           "tokenizer": "default"
         },
         "stored": true,
-        "fast": true
-      }
-    },
-    {
-      "name": "size",
-      "type": "text",
-      "options": {
-        "stored": true,
         "fast": false
-      }
-    },
-    {
-      "name": "size_formatted",
-      "type": "text",
-      "options": {
-        "stored": true,
-        "fast": true
       }
     },
     {
       "name": "modified",
       "type": "text",
       "options": {
+        "indexing": {
+          "record": "position",
+          "fieldnorms": true,
+          "tokenizer": "default"
+        },
         "stored": true,
         "fast": false
       }
     },
     {
-      "name": "modified_formatted",
-      "type": "text",
-      "options": {
-        "stored": true,
-        "fast": true
-      }
-    },
-    {
-      "name": "trigrams",
-      "type": "text",
-      "options": {
-        "indexing": {
-          "record": "position",
-          "fieldnorms": true,
-          "tokenizer": "default"
-        },
-        "stored": false,
-        "fast": true
-      }
-    },
-    {
-      "name": "file_extension",
+      "name": "size",
       "type": "text",
       "options": {
         "indexing": {
@@ -112,15 +80,7 @@
           "tokenizer": "default"
         },
         "stored": true,
-        "fast": true
-      }
-    },
-    {
-      "name": "permissions",
-      "type": "text",
-      "options": {
-        "stored": true,
-        "fast": true
+        "fast": false
       }
     }
   ],
